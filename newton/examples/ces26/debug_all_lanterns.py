@@ -260,27 +260,6 @@ def get_material_color(prim, time_code, usd_file_dir: str):
     return None
 
 
-def rotate_points_by_quaternion(points: np.ndarray, quat_wxyz: tuple) -> np.ndarray:
-    """
-    Rotate points by a quaternion using vectorized operations.
-    
-    Args:
-        points: (N, 3) array of points
-        quat_wxyz: quaternion as (w, x, y, z) - USD/GfQuaternion convention
-        
-    Returns:
-        (N, 3) array of rotated points
-    """
-    w, x, y, z = quat_wxyz
-    q_vec = np.array([x, y, z], dtype=np.float64)
-    
-    # Rodrigues rotation formula via quaternion:
-    # t = 2 * (q_xyz × v)
-    # v' = v + w*t + (q_xyz × t)
-    t = 2.0 * np.cross(q_vec, points)
-    rotated = points + w * t + np.cross(q_vec, t)
-    return rotated
-
 
 def main():
     print(f"Loading: {USD_FILE}")
@@ -309,8 +288,8 @@ def main():
         path_str = str(prim.GetPath())
         
         # Check if this prim path contains our target pattern (case-insensitive)
-        if TARGET_PATTERN.lower() not in path_str.lower():
-            continue
+        #if TARGET_PATTERN.lower() not in path_str.lower():
+        #    continue
 
         
         meshPrim = prim 
@@ -410,23 +389,26 @@ def main():
         pm = ps.register_surface_mesh(m["name"], m["vertices"], m["faces"])
         
         # Prefer material color, fall back to displayColor
-        matCol = m["materialColor"]
-        dispCol = m["displayColor"]
-        
-        if matCol is not None:
-            print(f"  {name}: using materialColor {matCol}")
-            pm.set_color(tuple(matCol[:3]))
-        elif dispCol is not None and len(dispCol) > 0:
-            # displayColor might be per-vertex or constant
-            if hasattr(dispCol[0], '__iter__'):
-                # It's an array of colors, use the first one as constant
-                col = tuple(dispCol[0])[:3]
+        try:
+            matCol = m["materialColor"]
+            dispCol = m["displayColor"]
+            
+            if matCol is not None:
+                print(f"  {name}: using materialColor {matCol}")
+                pm.set_color(tuple(matCol[:3]))
+            elif dispCol is not None and len(dispCol) > 0:
+                # displayColor might be per-vertex or constant
+                if hasattr(dispCol[0], '__iter__'):
+                    # It's an array of colors, use the first one as constant
+                    col = tuple(dispCol[0])[:3]
+                else:
+                    col = tuple(dispCol)[:3]
+                print(f"  {name}: using displayColor {col}")
+                pm.set_color(col)
             else:
-                col = tuple(dispCol)[:3]
-            print(f"  {name}: using displayColor {col}")
-            pm.set_color(col)
-        else:
-            print(f"  {name}: no color found, using default")
+                print(f"  {name}: no color found, using default")
+        except Exception as e:
+            print(f"WARNING: failed to set color for mesh {name}: {e}")
 
     
     print("\nPolyscope viewer opened. Close window to exit.")
