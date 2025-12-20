@@ -42,4 +42,5 @@ asv/html
 # Log files, settings
 MUJOCO_LOG.TXT
 imgui.ini
+.polyscope.ini 
 newton/tests/outputs/
