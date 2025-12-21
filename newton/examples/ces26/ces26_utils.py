@@ -1101,3 +1101,49 @@ def is_proxy_path(path: str) -> bool:
     """Check if a prim path appears to be proxy geometry."""
     return "/proxy/" in path.lower()
 
+
+# =============================================================================
+# Polyscope Visualization (Alternative Consumer)
+# =============================================================================
+
+def setup_polyscope(up_direction: str = "z_up") -> None:
+    """
+    Initialize polyscope with standard settings.
+    
+    Args:
+        up_direction: Up direction ("z_up", "y_up", etc.)
+    """
+    import polyscope as ps
+    ps.init()
+    ps.set_up_dir(up_direction)
+
+
+def register_diegetics_with_polyscope(
+    diegetics: list[Diegetic],
+    channel: ColorChannel = ColorChannel.DIFFUSE_ALBEDO,
+    verbose: bool = False,
+) -> None:
+    """
+    Register Diegetics with polyscope for interactive visualization.
+    
+    Args:
+        diegetics: List of Diegetic scene elements
+        channel: Which color channel to use for visualization
+        verbose: If True, print registration info
+    """
+    import polyscope as ps
+    
+    for d in diegetics:
+        pm = ps.register_surface_mesh(d.name, d.vertices, d.faces)
+        color = d.get_color(channel)
+        pm.set_color(color)
+        
+        if verbose:
+            print(f"  {d.name}: {color}")
+
+
+def show_polyscope() -> None:
+    """Show the polyscope viewer (blocking)."""
+    import polyscope as ps
+    ps.show()
+
