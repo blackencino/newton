@@ -1,25 +1,26 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 """
-Reusable utilities for loading and visualizing USD scene geometry.
+Functional utilities for loading and rendering USD scene geometry.
 
-Provides clean, modular components for:
-- Loading meshes from USD stages with proper transform handling
-- Resolving UDIM textures and computing average colors
-- Extracting material colors from UsdPreviewSurface shaders
-- Visualizing meshes with polyscope
+Core concepts:
+- Diegetic: An immutable scene element with geometry and multiple color channels
+- ColorExtractor: A function that extracts a color from a USD prim
+- parse_diegetics: A fold that maps geometry + color extractors over a USD stage
 
-These utilities are designed to be used across various test and debug scripts.
+The pipeline is: USD Stage → list[Diegetic] → RenderContext → pixels
 """
 
 from __future__ import annotations
 
 import glob
+import hashlib
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Protocol
 
 import numpy as np
 import warp as wp
@@ -36,41 +37,268 @@ except ImportError:
 
 
 # =============================================================================
-# Data Classes
+# Type Aliases
 # =============================================================================
 
-@dataclass
-class MeshData:
-    """Container for extracted mesh geometry and material information."""
+RGB = tuple[float, float, float]
+
+
+# =============================================================================
+# Color Extractor Protocol
+# =============================================================================
+
+@dataclass(frozen=True)
+class ExtractionContext:
+    """Immutable context passed to color extractors."""
+    usd_file_dir: str
+    time_code: Usd.TimeCode
+    prim_index: int  # For deterministic random colors
+
+
+class ColorExtractor(Protocol):
+    """Protocol for functions that extract a color from a USD prim."""
+    def __call__(self, prim: Usd.Prim, ctx: ExtractionContext) -> RGB: ...
+
+
+# =============================================================================
+# Diegetic: The Core Scene Element
+# =============================================================================
+
+class ColorChannel(Enum):
+    """Selects which color channel to use for rendering."""
+    DIFFUSE_ALBEDO = "diffuse_albedo"
+    OBJECT_ID = "object_id"
+    SEMANTIC = "semantic"
+
+
+@dataclass(frozen=True)
+class Diegetic:
+    """
+    An immutable scene element with geometry and multiple color channels.
+    
+    "Diegetic" (from film theory): existing within the world of the narrative.
+    Each Diegetic represents a visible piece of the scene with pre-computed colors
+    for different rendering purposes.
+    """
     name: str
     path: str
-    vertices: np.ndarray  # World-space vertex positions (N, 3)
-    faces: np.ndarray  # Triangle indices (M, 3)
-    display_color: tuple[float, float, float] | None = None
-    material_color: tuple[float, float, float] | None = None
-    object_id_color: tuple[float, float, float] | None = None  # From primvars:objectid_color
+    vertices: np.ndarray  # World-space positions (N, 3), float32
+    faces: np.ndarray     # Triangle indices (M, 3), int32
+    diffuse_albedo: RGB   # For photorealistic rendering
+    object_id: RGB        # For instance segmentation
+    semantic: RGB         # For semantic segmentation
     
-    def get_color(self) -> tuple[float, float, float] | None:
-        """Return the best available color (material preferred over display)."""
-        return self.material_color or self.display_color
+    def get_color(self, channel: ColorChannel) -> RGB:
+        """Return the color for the specified channel."""
+        if channel == ColorChannel.DIFFUSE_ALBEDO:
+            return self.diffuse_albedo
+        elif channel == ColorChannel.OBJECT_ID:
+            return self.object_id
+        else:
+            return self.semantic
 
 
-@dataclass
-class MeshLoadOptions:
-    """Options for controlling mesh loading behavior."""
-    time_code: Usd.TimeCode = field(default_factory=lambda: Usd.TimeCode.Default())
-    load_material_colors: bool = True
-    load_texture_colors: bool = False  # Requires PIL
-    path_filter: Callable[[str], bool] | None = None  # Return True to include
+@dataclass(frozen=True)
+class ParseOptions:
+    """Immutable options for parsing USD stages."""
+    time_code: Usd.TimeCode
+    path_filter: Callable[[str], bool] | None = None
     skip_invisible: bool = True
-    skip_proxy: bool = True  # Skip paths containing "/proxy/"
+    skip_proxy: bool = True
+
+
+# =============================================================================
+# Color Extractor Factory Functions
+# =============================================================================
+
+def constant_color(rgb: RGB) -> ColorExtractor:
+    """
+    Create an extractor that always returns the same color.
     
-    def __post_init__(self):
-        if self.load_texture_colors and not _PIL_AVAILABLE:
-            raise ImportError(
-                "PIL/Pillow is required for texture color loading. "
-                "Install with: pip install Pillow"
-            )
+    Usage:
+        extractor = constant_color((0.5, 0.5, 0.5))
+    """
+    def extract(prim: Usd.Prim, ctx: ExtractionContext) -> RGB:
+        return rgb
+    return extract
+
+
+def random_color(seed: int = 42, brightness_range: tuple[float, float] = (0.3, 0.9)) -> ColorExtractor:
+    """
+    Create an extractor that returns a deterministic random color per prim.
+    
+    Uses prim path hash + seed for reproducibility.
+    Colors are in HSV with full saturation, converted to RGB.
+    
+    Usage:
+        extractor = random_color(seed=123)
+    """
+    lo, hi = brightness_range
+    
+    def extract(prim: Usd.Prim, ctx: ExtractionContext) -> RGB:
+        # Hash prim path + seed for deterministic but varied colors
+        path_hash = hashlib.md5(f"{prim.GetPath()}{seed}".encode()).digest()
+        hue = int.from_bytes(path_hash[:2], 'little') / 65535.0
+        
+        # HSV to RGB with S=1, V in brightness range
+        v = lo + (hi - lo) * (int.from_bytes(path_hash[2:4], 'little') / 65535.0)
+        
+        # Simple HSV->RGB
+        h = hue * 6.0
+        c = v  # S=1, so c=v*s=v
+        x = c * (1 - abs(h % 2 - 1))
+        
+        if h < 1: r, g, b = c, x, 0.0
+        elif h < 2: r, g, b = x, c, 0.0
+        elif h < 3: r, g, b = 0.0, c, x
+        elif h < 4: r, g, b = 0.0, x, c
+        elif h < 5: r, g, b = x, 0.0, c
+        else: r, g, b = c, 0.0, x
+        
+        return (r, g, b)
+    return extract
+
+
+def primvar_color(primvar_name: str, fallback: RGB) -> ColorExtractor:
+    """
+    Create an extractor that reads a named primvar (color3f, constant interpolation).
+    
+    Usage:
+        extractor = primvar_color("objectid_color", fallback=(1.0, 0.0, 1.0))
+    """
+    def extract(prim: Usd.Prim, ctx: ExtractionContext) -> RGB:
+        primvars_api = UsdGeom.PrimvarsAPI(prim)
+        primvar = primvars_api.GetPrimvar(primvar_name)
+        
+        if not primvar or not primvar.HasValue():
+            return fallback
+        
+        if primvar.GetInterpolation() != UsdGeom.Tokens.constant:
+            return fallback
+        
+        value = primvar.Get(ctx.time_code)
+        if value is None:
+            return fallback
+        
+        try:
+            if hasattr(value, '__getitem__') and len(value) >= 3:
+                return (float(value[0]), float(value[1]), float(value[2]))
+        except (TypeError, IndexError):
+            pass
+        
+        return fallback
+    return extract
+
+
+def display_color_extractor(fallback: RGB) -> ColorExtractor:
+    """
+    Create an extractor that reads the displayColor primvar.
+    
+    Usage:
+        extractor = display_color_extractor(fallback=(0.7, 0.7, 0.7))
+    """
+    def extract(prim: Usd.Prim, ctx: ExtractionContext) -> RGB:
+        if not prim.IsA(UsdGeom.Mesh):
+            return fallback
+        
+        mesh = UsdGeom.Mesh(prim)
+        display_color_raw = mesh.GetDisplayColorPrimvar().Get(ctx.time_code)
+        
+        if display_color_raw is None or len(display_color_raw) == 0:
+            return fallback
+        
+        first = display_color_raw[0]
+        if hasattr(first, '__getitem__'):
+            return (float(first[0]), float(first[1]), float(first[2]))
+        
+        return fallback
+    return extract
+
+
+def material_diffuse_extractor(fallback: RGB, load_textures: bool = False) -> ColorExtractor:
+    """
+    Create an extractor that reads UsdPreviewSurface diffuseColor.
+    
+    If load_textures is True and diffuseColor is connected to a texture,
+    attempts to sample the texture's average color.
+    
+    Usage:
+        extractor = material_diffuse_extractor(fallback=(0.5, 0.5, 0.5))
+    """
+    def extract(prim: Usd.Prim, ctx: ExtractionContext) -> RGB:
+        materialBinding = UsdShade.MaterialBindingAPI(prim)
+        boundMaterial, _ = materialBinding.ComputeBoundMaterial()
+        
+        if not boundMaterial:
+            return fallback
+        
+        surfaceOutput = boundMaterial.GetSurfaceOutput()
+        if not surfaceOutput:
+            return fallback
+        
+        connectedSource = surfaceOutput.GetConnectedSource()
+        if not connectedSource:
+            return fallback
+        
+        shaderPrim = connectedSource[0].GetPrim()
+        shader = UsdShade.Shader(shaderPrim)
+        
+        diffuseInput = shader.GetInput("diffuseColor")
+        if not diffuseInput:
+            return fallback
+        
+        connSrc = diffuseInput.GetConnectedSource()
+        if connSrc:
+            # Connected to texture
+            connectedShader = UsdShade.Shader(connSrc[0].GetPrim())
+            
+            if load_textures and _PIL_AVAILABLE:
+                fileInput = connectedShader.GetInput("file")
+                if fileInput:
+                    fileVal = fileInput.Get(ctx.time_code)
+                    if fileVal:
+                        avg_color = get_texture_average_color(
+                            fileVal.path, ctx.usd_file_dir, verbose=False
+                        )
+                        if avg_color is not None:
+                            return avg_color
+            
+            # Try fallback from texture shader
+            fallbackInput = connectedShader.GetInput("fallback")
+            if fallbackInput:
+                fallbackVal = fallbackInput.Get(ctx.time_code)
+                if fallbackVal is not None:
+                    return (float(fallbackVal[0]), float(fallbackVal[1]), float(fallbackVal[2]))
+        else:
+            # Direct value
+            val = diffuseInput.Get(ctx.time_code)
+            if val is not None and hasattr(val, '__iter__'):
+                return (float(val[0]), float(val[1]), float(val[2]))
+        
+        return fallback
+    return extract
+
+
+def first_of(*extractors: ColorExtractor, fallback: RGB = (0.5, 0.5, 0.5)) -> ColorExtractor:
+    """
+    Create an extractor that tries each extractor in order, returning the first non-fallback result.
+    
+    This is a combinator for building fallback chains.
+    
+    Usage:
+        extractor = first_of(
+            material_diffuse_extractor((0.5, 0.5, 0.5)),
+            display_color_extractor((0.5, 0.5, 0.5)),
+            fallback=(0.7, 0.7, 0.7)
+        )
+    """
+    def extract(prim: Usd.Prim, ctx: ExtractionContext) -> RGB:
+        for ext in extractors:
+            result = ext(prim, ctx)
+            if result != fallback:
+                return result
+        return fallback
+    return extract
 
 
 @dataclass
@@ -82,6 +310,23 @@ class CameraData:
     forward: np.ndarray       # Camera view direction (-Z in local) in world space (normalized)
     fov_vertical: float       # Vertical field of view in radians
     fov_horizontal: float     # Horizontal field of view in radians
+
+
+# =============================================================================
+# Render Configuration
+# =============================================================================
+
+@dataclass(frozen=True)
+class RenderConfig:
+    """Immutable configuration for rendering output."""
+    width: int
+    height: int
+    output_dir: Path
+    filename_pattern: str = "render.{frame}.png"
+    
+    def get_output_path(self, frame: int) -> Path:
+        """Get the full output path for a given frame number."""
+        return self.output_dir / self.filename_pattern.format(frame=frame)
 
 
 # =============================================================================
@@ -128,6 +373,238 @@ def transform_points_to_world(
     pts_h = np.concatenate([pts, np.ones((pts.shape[0], 1), dtype=np.float64)], axis=1)
     pts_world_h = pts_h @ M  # Row-vectors * matrix
     return pts_world_h[:, :3]
+
+
+# =============================================================================
+# Geometry Extraction
+# =============================================================================
+
+@dataclass(frozen=True)
+class ExtractedGeometry:
+    """Intermediate result from geometry extraction."""
+    name: str
+    path: str
+    vertices: np.ndarray  # World-space (N, 3) float32
+    faces: np.ndarray     # Triangle indices (M, 3) int32
+
+
+def extract_geometry(
+    prim: Usd.Prim,
+    xcache: UsdGeom.XformCache,
+    time_code: Usd.TimeCode
+) -> ExtractedGeometry | None:
+    """
+    Extract world-space triangulated geometry from a mesh prim.
+    
+    Handles instanced geometry by getting geometry from prototype
+    and transform from the proxy prim.
+    
+    Returns None if geometry cannot be extracted.
+    """
+    # Get the actual geometry prim (prototype for instances)
+    if prim.IsInstanceProxy():
+        geom_prim = prim.GetPrimInPrototype()
+    else:
+        geom_prim = prim
+    
+    mesh = UsdGeom.Mesh(geom_prim)
+    
+    points = mesh.GetPointsAttr().Get(time_code)
+    indices = mesh.GetFaceVertexIndicesAttr().Get(time_code)
+    counts = mesh.GetFaceVertexCountsAttr().Get(time_code)
+    
+    if not points or not indices or not counts:
+        return None
+    
+    # Transform using the proxy prim's world transform
+    world_mat = xcache.GetLocalToWorldTransform(prim)
+    vertices = transform_points_to_world(points, world_mat).astype(np.float32)
+    
+    # Triangulate
+    faces = triangulate(np.array(indices), np.array(counts))
+    
+    path_str = str(prim.GetPath())
+    name = path_str.split("/")[-1]
+    
+    return ExtractedGeometry(
+        name=name,
+        path=path_str,
+        vertices=vertices,
+        faces=faces,
+    )
+
+
+def is_visible_mesh(prim: Usd.Prim, time_code: Usd.TimeCode) -> bool:
+    """Check if a prim is a visible mesh (not invisible for rendering)."""
+    if not prim.IsA(UsdGeom.Mesh):
+        return False
+    
+    # Get geometry prim for visibility check
+    if prim.IsInstanceProxy():
+        geom_prim = prim.GetPrimInPrototype()
+    else:
+        geom_prim = prim
+    
+    mesh = UsdGeom.Mesh(geom_prim)
+    visibility = mesh.ComputeEffectiveVisibility(UsdGeom.Tokens.render, time_code)
+    return visibility != UsdGeom.Tokens.invisible
+
+
+# =============================================================================
+# Parse Diegetics: The Fold Function
+# =============================================================================
+
+def parse_diegetics(
+    stage: Usd.Stage,
+    usd_file_path: str,
+    options: ParseOptions,
+    diffuse_extractor: ColorExtractor,
+    object_id_extractor: ColorExtractor,
+    semantic_extractor: ColorExtractor,
+    verbose: bool = False,
+    show_progress: bool = True,
+    progress_interval: int = 1000,
+) -> list[Diegetic]:
+    """
+    Parse a USD stage into a list of Diegetic scene elements.
+    
+    This is the core "fold" function that maps:
+    - A geometry extractor (hardcoded for triangle meshes)
+    - Three color extractors (one per color channel)
+    
+    Over the USD stage to produce immutable Diegetics.
+    
+    Args:
+        stage: Opened USD stage
+        usd_file_path: Path to USD file (for texture resolution)
+        options: ParseOptions controlling traversal behavior
+        diffuse_extractor: Extracts diffuse_albedo color
+        object_id_extractor: Extracts object_id color
+        semantic_extractor: Extracts semantic color
+        verbose: Print detailed progress
+        show_progress: Print periodic progress updates
+        progress_interval: Update interval for progress messages
+        
+    Returns:
+        List of Diegetic objects with geometry and all color channels populated
+    """
+    usd_file_dir = os.path.dirname(usd_file_path)
+    time_code = options.time_code
+    xcache = UsdGeom.XformCache(time_code)
+    
+    diegetics: list[Diegetic] = []
+    prims_processed = 0
+    prims_skipped = 0
+    
+    if show_progress:
+        print("Parsing USD stage into Diegetics...", flush=True)
+    
+    for prim_index, prim in enumerate(Usd.PrimRange(stage.GetPseudoRoot(), Usd.TraverseInstanceProxies())):
+        prims_processed += 1
+        
+        if show_progress and prims_processed % progress_interval == 0:
+            print(f"  Processed {prims_processed} prims, found {len(diegetics)} diegetics...", flush=True)
+        
+        # Filter: must be a mesh
+        if not prim.IsA(UsdGeom.Mesh):
+            continue
+        
+        path_str = str(prim.GetPath())
+        
+        # Filter: user-provided path filter
+        if options.path_filter is not None and not options.path_filter(path_str):
+            continue
+        
+        # Filter: visibility
+        if options.skip_invisible and not is_visible_mesh(prim, time_code):
+            if verbose:
+                print(f"  SKIP (invisible): {path_str}")
+            prims_skipped += 1
+            continue
+        
+        # Filter: proxy geometry
+        if options.skip_proxy and is_proxy_path(path_str):
+            if verbose:
+                print(f"  SKIP (proxy): {path_str}")
+            prims_skipped += 1
+            continue
+        
+        # Extract geometry
+        geom = extract_geometry(prim, xcache, time_code)
+        if geom is None:
+            if verbose:
+                print(f"  SKIP (no geometry): {path_str}")
+            prims_skipped += 1
+            continue
+        
+        # Create extraction context
+        ctx = ExtractionContext(
+            usd_file_dir=usd_file_dir,
+            time_code=time_code,
+            prim_index=prim_index,
+        )
+        
+        # Extract all three colors
+        diffuse = diffuse_extractor(prim, ctx)
+        object_id = object_id_extractor(prim, ctx)
+        semantic = semantic_extractor(prim, ctx)
+        
+        # Create immutable Diegetic
+        diegetic = Diegetic(
+            name=geom.name,
+            path=geom.path,
+            vertices=geom.vertices,
+            faces=geom.faces,
+            diffuse_albedo=diffuse,
+            object_id=object_id,
+            semantic=semantic,
+        )
+        
+        diegetics.append(diegetic)
+        
+        if verbose:
+            print(f"  PARSED: {path_str} ({len(geom.vertices)} verts, {len(geom.faces)} tris)")
+    
+    if show_progress:
+        print(f"  Done: {prims_processed} prims → {len(diegetics)} diegetics, {prims_skipped} skipped", flush=True)
+    
+    return diegetics
+
+
+def make_diegetic_names_unique(diegetics: list[Diegetic]) -> list[Diegetic]:
+    """
+    Return new list of Diegetics with unique names.
+    
+    Unlike make_mesh_names_unique, this is a pure function that returns
+    new Diegetic objects (since Diegetic is frozen).
+    """
+    name_counts: dict[str, int] = {}
+    result: list[Diegetic] = []
+    
+    for d in diegetics:
+        name = d.name
+        if name in name_counts:
+            name_counts[name] += 1
+            new_name = f"{name}_{name_counts[name]}"
+        else:
+            name_counts[name] = 1
+            new_name = name
+        
+        # Create new Diegetic with updated name (if changed)
+        if new_name != name:
+            result.append(Diegetic(
+                name=new_name,
+                path=d.path,
+                vertices=d.vertices,
+                faces=d.faces,
+                diffuse_albedo=d.diffuse_albedo,
+                object_id=d.object_id,
+                semantic=d.semantic,
+            ))
+        else:
+            result.append(d)
+    
+    return result
 
 
 # =============================================================================
@@ -282,156 +759,43 @@ def transforms_and_rays_from_camera_data(camera: CameraData, width: int, height:
 
 
 # =============================================================================
-# Render Configuration & Scene Representation
+# Rendering (Diegetic -> Pixels)
 # =============================================================================
 
-@dataclass(frozen=True)
-class RenderConfig:
-    """Immutable configuration for rendering output."""
-    width: int
-    height: int
-    output_dir: Path
-    filename_pattern: str = "render.{frame}.png"
-    
-    def get_output_path(self, frame: int) -> Path:
-        """Get the full output path for a given frame number."""
-        return self.output_dir / self.filename_pattern.format(frame=frame)
-
-
-@dataclass(frozen=True)
-class SceneShape:
-    """Immutable representation of a renderable shape in the scene."""
-    vertices: np.ndarray  # (N, 3) float32
-    faces: np.ndarray     # (M, 3) int32
-    color: tuple[float, float, float, float]  # RGBA
-    name: str = ""
-
-
-# =============================================================================
-# Scene Building (MeshData -> SceneShape conversion)
-# =============================================================================
-
-def assign_random_colors(meshes: list[MeshData], seed: int = 42) -> list[SceneShape]:
+def setup_render_context(
+    diegetics: list[Diegetic],
+    config: RenderConfig,
+    channel: ColorChannel = ColorChannel.DIFFUSE_ALBEDO,
+) -> tuple[RenderContext, list]:
     """
-    Convert MeshData to SceneShapes with random colors.
+    Create RenderContext from Diegetics using the specified color channel.
     
-    Colors are assigned deterministically based on the seed.
-    If a mesh has a color from USD, we could use it here instead;
-    this function specifically randomizes for debugging/visualization.
-    """
-    rng = np.random.default_rng(seed)
-    shapes = []
-    
-    for mesh in meshes:
-        # Random color in range [0.5, 1.0] for visibility
-        rgb = rng.random(3).astype(np.float32) * 0.5 + 0.5
-        color = (float(rgb[0]), float(rgb[1]), float(rgb[2]), 1.0)
-        
-        shapes.append(SceneShape(
-            vertices=mesh.vertices.astype(np.float32),
-            faces=mesh.faces,
-            color=color,
-            name=mesh.name,
-        ))
-    
-    return shapes
-
-
-def use_mesh_colors(
-    meshes: list[MeshData],
-    fallback_color: tuple[float, float, float, float] = (0.7, 0.7, 0.7, 1.0)
-) -> list[SceneShape]:
-    """
-    Convert MeshData to SceneShapes using colors extracted from USD.
-    
-    Uses material_color if available, then display_color, then fallback.
-    """
-    shapes = []
-    
-    for mesh in meshes:
-        mesh_color = mesh.get_color()
-        if mesh_color is not None:
-            color = (mesh_color[0], mesh_color[1], mesh_color[2], 1.0)
-        else:
-            color = fallback_color
-        
-        shapes.append(SceneShape(
-            vertices=mesh.vertices.astype(np.float32),
-            faces=mesh.faces,
-            color=color,
-            name=mesh.name,
-        ))
-    
-    return shapes
-
-
-def use_object_id_colors(
-    meshes: list[MeshData],
-    error_color: tuple[float, float, float, float] = (1.0, 0.5, 0.0, 1.0)
-) -> list[SceneShape]:
-    """
-    Convert MeshData to SceneShapes using object_id_color from primvars.
-    
-    Uses the object_id_color field read from primvars:objectid_color.
-    If a mesh doesn't have a valid object_id_color, uses the error_color
-    (bright orange by default) to make missing data visually obvious.
+    This is the preferred rendering entry point for the new functional pipeline.
     
     Args:
-        meshes: List of MeshData objects to convert
-        error_color: RGBA color to use when object_id_color is missing (default: bright orange)
+        diegetics: List of Diegetic scene elements
+        config: Render configuration (resolution, output path)
+        channel: Which color channel to use for rendering
         
-    Returns:
-        List of SceneShape objects ready for rendering
-    """
-    shapes = []
-    
-    for mesh in meshes:
-        if mesh.object_id_color is not None:
-            color = (mesh.object_id_color[0], mesh.object_id_color[1], mesh.object_id_color[2], 1.0)
-        else:
-            color = error_color
-        
-        shapes.append(SceneShape(
-            vertices=mesh.vertices.astype(np.float32),
-            faces=mesh.faces,
-            color=color,
-            name=mesh.name,
-        ))
-    
-    return shapes
-
-
-# =============================================================================
-# Rendering (Scene -> Pixels)
-# =============================================================================
-
-def setup_render_context(shapes: list[SceneShape], config: RenderConfig) -> tuple[RenderContext, list]:
-    """
-    Create and configure RenderContext from scene shapes.
-    
-    This function converts the geometric scene representation into the 
-    internal structures needed by the renderer. All scene data (geometry,
-    colors, transforms) should be fully specified in the input shapes.
-    
     Returns:
         Tuple of (RenderContext, list of warp.Mesh objects)
     """
-    num_shapes = len(shapes)
-    print(f"Setting up render context with {num_shapes} shapes...")
+    num_shapes = len(diegetics)
+    print(f"Setting up render context with {num_shapes} diegetics (channel: {channel.value})...")
 
     warp_meshes = []
     mesh_bounds = np.zeros((num_shapes, 2, 3), dtype=np.float32)
     scene_min = np.full(3, np.inf)
     scene_max = np.full(3, -np.inf)
 
-    for i, shape in enumerate(shapes):
+    for i, d in enumerate(diegetics):
         mesh = wp.Mesh(
-            points=wp.array(shape.vertices, dtype=wp.vec3f),
-            indices=wp.array(shape.faces.flatten(), dtype=wp.int32),
+            points=wp.array(d.vertices, dtype=wp.vec3f),
+            indices=wp.array(d.faces.flatten(), dtype=wp.int32),
         )
         warp_meshes.append(mesh)
-        mesh_bounds[i, 0] = shape.vertices.min(axis=0)
-        mesh_bounds[i, 1] = shape.vertices.max(axis=0)
+        mesh_bounds[i, 0] = d.vertices.min(axis=0)
+        mesh_bounds[i, 1] = d.vertices.max(axis=0)
         scene_min = np.minimum(scene_min, mesh_bounds[i, 0])
         scene_max = np.maximum(scene_max, mesh_bounds[i, 1])
     
@@ -458,8 +822,10 @@ def setup_render_context(shapes: list[SceneShape], config: RenderConfig) -> tupl
     ctx.shape_transforms = wp.array(transforms, dtype=wp.transformf)
     ctx.shape_sizes = wp.array([[1, 1, 1]] * num_shapes, dtype=wp.vec3f)
 
-    # Use colors from scene shapes
-    colors = np.array([s.color for s in shapes], dtype=np.float32)
+    # Extract colors from diegetics using specified channel
+    colors = np.array([
+        (*d.get_color(channel), 1.0) for d in diegetics
+    ], dtype=np.float32)
     ctx.shape_colors = wp.array(colors, dtype=wp.vec4f)
 
     ctx.lights_active = wp.array([True], dtype=wp.bool)
@@ -692,217 +1058,7 @@ def get_texture_average_color(
 
 
 # =============================================================================
-# Material Utilities
-# =============================================================================
-
-def get_material_color(
-    prim: Usd.Prim,
-    time_code: Usd.TimeCode,
-    usd_file_dir: str,
-    load_textures: bool = False,
-    verbose: bool = False
-) -> tuple[float, float, float] | None:
-    """
-    Extract diffuseColor from UsdPreviewSurface material bound to a prim.
-    
-    If load_textures is True and the diffuseColor is connected to a texture,
-    attempts to load the texture and compute its average color.
-    
-    Args:
-        prim: The USD prim (mesh) to get material from
-        time_code: USD time code for sampling
-        usd_file_dir: Directory of the USD file for resolving texture paths
-        load_textures: If True, attempt to load and sample textures
-        verbose: If True, print debug information
-        
-    Returns:
-        tuple (r, g, b) or None if no color found
-    """
-    materialBinding = UsdShade.MaterialBindingAPI(prim)
-    boundMaterial, bindingRel = materialBinding.ComputeBoundMaterial()
-    
-    if not boundMaterial:
-        return None
-    
-    # Try to get the surface shader output
-    surfaceOutput = boundMaterial.GetSurfaceOutput()
-    if not surfaceOutput:
-        return None
-    
-    # Get connected shader
-    connectedSource = surfaceOutput.GetConnectedSource()
-    if not connectedSource:
-        return None
-    
-    shaderPrim = connectedSource[0].GetPrim()
-    shader = UsdShade.Shader(shaderPrim)
-    
-    # Check shader type
-    shaderId = shader.GetIdAttr().Get()
-    if verbose:
-        print(f"      Shader ID: {shaderId}")
-    
-    # Try diffuseColor first (UsdPreviewSurface standard)
-    diffuseInput = shader.GetInput("diffuseColor")
-    if diffuseInput:
-        # Check if it's connected to another shader (e.g., a texture)
-        connSrc = diffuseInput.GetConnectedSource()
-        if connSrc:
-            # It's connected to something (likely a texture reader - UsdUVTexture)
-            connectedShader = UsdShade.Shader(connSrc[0].GetPrim())
-            connectedShaderId = connectedShader.GetIdAttr().Get()
-            
-            if verbose:
-                texturePrimPath = connSrc[0].GetPrim().GetPath()
-                print(f"      diffuseColor is connected to: {texturePrimPath}")
-                print(f"        Connected shader ID: {connectedShaderId}")
-            
-            # Try to get the texture file path
-            if load_textures:
-                fileInput = connectedShader.GetInput("file")
-                if fileInput:
-                    fileVal = fileInput.Get(time_code)
-                    if fileVal:
-                        texturePath = fileVal.path
-                        if verbose:
-                            print(f"        Texture file (authored): {texturePath}")
-                            print(f"        Texture file (resolved by USD): {fileVal.resolvedPath}")
-                        
-                        avgColor = get_texture_average_color(
-                            texturePath, usd_file_dir, verbose=verbose
-                        )
-                        if avgColor is not None:
-                            return avgColor
-            
-            # Fallback: check for fallback input on the texture shader
-            fallbackInput = connectedShader.GetInput("fallback")
-            if fallbackInput:
-                fallbackVal = fallbackInput.Get(time_code)
-                if fallbackVal is not None:
-                    if verbose:
-                        print(f"        Using fallback from texture: {fallbackVal}")
-                    return tuple(fallbackVal)[:3]
-        else:
-            # Direct value (not connected to texture)
-            val = diffuseInput.Get(time_code)
-            if val is not None:
-                if verbose:
-                    print(f"      diffuseColor value: {val}")
-                if hasattr(val, '__iter__'):
-                    return tuple(val)[:3]
-    
-    # Try baseColor (some shaders use this)
-    baseColorInput = shader.GetInput("baseColor")
-    if baseColorInput:
-        val = baseColorInput.Get(time_code)
-        if val is not None:
-            if verbose:
-                print(f"      baseColor value: {val}")
-            if hasattr(val, '__iter__'):
-                return tuple(val)[:3]
-    
-    # Debug: list all inputs if verbose
-    if verbose:
-        print(f"      All shader inputs:")
-        for inp in shader.GetInputs():
-            inpName = inp.GetBaseName()
-            inpVal = inp.Get(time_code)
-            connSrc = inp.GetConnectedSource()
-            if connSrc:
-                print(f"        {inpName}: connected to {connSrc[0].GetPrim().GetPath()}")
-            else:
-                print(f"        {inpName}: {inpVal}")
-    
-    return None
-
-
-def extract_display_color(
-    display_color_primvar
-) -> tuple[float, float, float] | None:
-    """
-    Extract a single RGB color from a displayColor primvar value.
-    
-    Args:
-        display_color_primvar: Raw value from GetDisplayColorPrimvar().Get()
-        
-    Returns:
-        tuple (r, g, b) or None if no valid color
-    """
-    if display_color_primvar is None or len(display_color_primvar) == 0:
-        return None
-    
-    first = display_color_primvar[0]
-    if hasattr(first, '__getitem__'):
-        # It's a Gf.Vec3f or similar - extract components explicitly
-        return (float(first[0]), float(first[1]), float(first[2]))
-    else:
-        # Might be a flat color value
-        return (float(display_color_primvar[0]), 
-                float(display_color_primvar[1]), 
-                float(display_color_primvar[2]))
-
-
-def extract_object_id_color(
-    prim: Usd.Prim,
-    time_code: Usd.TimeCode,
-    verbose: bool = False
-) -> tuple[float, float, float] | None:
-    """
-    Extract object ID color from primvars:objectid_color on a prim.
-    
-    Expects a constant (uniform) color3f primvar. Returns None if the primvar
-    doesn't exist, is not constant interpolation, or has invalid data.
-    
-    Args:
-        prim: The USD prim to read from
-        time_code: USD time code for sampling
-        verbose: If True, print debug information
-        
-    Returns:
-        tuple (r, g, b) or None if primvar missing/invalid
-    """
-    primvars_api = UsdGeom.PrimvarsAPI(prim)
-    primvar = primvars_api.GetPrimvar("objectid_color")
-    
-    if not primvar or not primvar.HasValue():
-        if verbose:
-            print(f"      No objectid_color primvar on {prim.GetPath()}")
-        return None
-    
-    # Check interpolation - we expect constant (one color for the whole mesh)
-    interpolation = primvar.GetInterpolation()
-    if interpolation != UsdGeom.Tokens.constant:
-        if verbose:
-            print(f"      objectid_color has interpolation '{interpolation}', expected 'constant'")
-        return None
-    
-    # Get the value
-    value = primvar.Get(time_code)
-    if value is None:
-        if verbose:
-            print(f"      objectid_color primvar has no value at {time_code}")
-        return None
-    
-    # Handle different value types
-    try:
-        if hasattr(value, '__getitem__') and len(value) >= 3:
-            # Vec3f, tuple, or similar
-            color = (float(value[0]), float(value[1]), float(value[2]))
-            if verbose:
-                print(f"      objectid_color: ({color[0]:.3f}, {color[1]:.3f}, {color[2]:.3f})")
-            return color
-        else:
-            if verbose:
-                print(f"      objectid_color has unexpected type: {type(value)}")
-            return None
-    except (TypeError, IndexError) as e:
-        if verbose:
-            print(f"      Failed to extract objectid_color: {e}")
-        return None
-
-
-# =============================================================================
-# Mesh Loading
+# USD Stage Loading
 # =============================================================================
 
 def open_usd_stage(usd_path: str, show_progress: bool = True) -> Usd.Stage:
@@ -944,295 +1100,4 @@ def open_usd_stage(usd_path: str, show_progress: bool = True) -> Usd.Stage:
 def is_proxy_path(path: str) -> bool:
     """Check if a prim path appears to be proxy geometry."""
     return "/proxy/" in path.lower()
-
-
-def load_meshes_from_stage(
-    stage: Usd.Stage,
-    usd_file_path: str,
-    options: MeshLoadOptions | None = None,
-    verbose: bool = False,
-    show_progress: bool = True,
-    progress_interval: int = 1000
-) -> list[MeshData]:
-    """
-    Load all visible mesh geometry from a USD stage.
-    
-    Handles instanced geometry correctly by:
-    - Traversing instance proxies
-    - Getting geometry from prototype prims
-    - Computing world transforms from proxy prims
-    
-    Args:
-        stage: Opened USD stage
-        usd_file_path: Path to the USD file (for resolving texture paths)
-        options: MeshLoadOptions controlling what to load
-        verbose: If True, print progress and debug information
-        show_progress: If True, print progress during traversal
-        progress_interval: Print progress every N prims processed
-        
-    Returns:
-        List of MeshData objects with world-space geometry
-    """
-    import sys
-    
-    if options is None:
-        options = MeshLoadOptions()
-    
-    usd_file_dir = os.path.dirname(usd_file_path)
-    time_code = options.time_code
-    xcache = UsdGeom.XformCache(time_code)
-    
-    meshes_found = []
-    prims_processed = 0
-    meshes_skipped = 0
-    
-    if show_progress:
-        print("Traversing USD stage...", flush=True)
-    
-    # Traverse including instance proxies
-    for prim in Usd.PrimRange(stage.GetPseudoRoot(), Usd.TraverseInstanceProxies()):
-        prims_processed += 1
-        
-        # Print progress periodically
-        if show_progress and prims_processed % progress_interval == 0:
-            print(f"  Processed {prims_processed} prims, found {len(meshes_found)} meshes...", flush=True)
-        if not prim.IsA(UsdGeom.Mesh):
-            continue
-        
-        path_str = str(prim.GetPath())
-        
-        # Apply path filter if provided
-        if options.path_filter is not None:
-            if not options.path_filter(path_str):
-                continue
-        
-        # Get the actual geometry prim (prototype for instances)
-        mesh_prim = prim
-        if mesh_prim.IsInstanceProxy():
-            geom_prim = mesh_prim.GetPrimInPrototype()
-        else:
-            geom_prim = mesh_prim
-        
-        mesh = UsdGeom.Mesh(geom_prim)
-        
-        # Check visibility
-        if options.skip_invisible:
-            if mesh.ComputeEffectiveVisibility(UsdGeom.Tokens.render, time_code) == UsdGeom.Tokens.invisible:
-                if verbose:
-                    print(f"  SKIPPING (invisible): {path_str}")
-                meshes_skipped += 1
-                continue
-        
-        # Skip proxy meshes
-        if options.skip_proxy and is_proxy_path(path_str):
-            if verbose:
-                print(f"  SKIPPING (proxy): {path_str}")
-            meshes_skipped += 1
-            continue
-        
-        # Extract geometry data
-        try:
-            points = mesh.GetPointsAttr().Get(time_code)
-            indices = mesh.GetFaceVertexIndicesAttr().Get(time_code)
-            counts = mesh.GetFaceVertexCountsAttr().Get(time_code)
-            
-            if not points or not indices or not counts:
-                if verbose:
-                    print(f"  SKIPPING (no geometry data): {path_str}")
-                continue
-            
-            # Transform to world space using the proxy prim's transform
-            world_mat = xcache.GetLocalToWorldTransform(mesh_prim)
-            pts_world = transform_points_to_world(points, world_mat)
-            
-            # Triangulate
-            tris = triangulate(np.array(indices), np.array(counts))
-            
-            # Get colors
-            display_color = None
-            material_color = None
-            object_id_color = None
-            
-            display_color_raw = mesh.GetDisplayColorPrimvar().Get(time_code)
-            display_color = extract_display_color(display_color_raw)
-            
-            if options.load_material_colors:
-                material_color = get_material_color(
-                    mesh_prim,
-                    time_code,
-                    usd_file_dir,
-                    load_textures=options.load_texture_colors,
-                    verbose=verbose
-                )
-            
-            # Extract object ID color from primvar
-            object_id_color = extract_object_id_color(geom_prim, time_code, verbose=verbose)
-            
-            mesh_data = MeshData(
-                name=path_str.split("/")[-1],
-                path=path_str,
-                vertices=pts_world,
-                faces=tris,
-                display_color=display_color,
-                material_color=material_color,
-                object_id_color=object_id_color,
-            )
-            
-            if verbose:
-                print(f"  LOADED: {path_str}")
-                print(f"          {len(pts_world)} verts, {len(tris)} triangles")
-            
-            meshes_found.append(mesh_data)
-            
-        except Exception as e:
-            if verbose:
-                print(f"  ERROR loading {path_str}: {e}")
-    
-    if show_progress:
-        print(f"  Done: {prims_processed} prims processed, {len(meshes_found)} meshes loaded, {meshes_skipped} skipped", flush=True)
-    
-    return meshes_found
-
-
-def make_mesh_names_unique(meshes: list[MeshData]) -> None:
-    """
-    Modify mesh names in-place to ensure uniqueness.
-    
-    Appends _2, _3, etc. to duplicate names.
-    """
-    name_counts: dict[str, int] = {}
-    
-    for mesh in meshes:
-        name = mesh.name
-        if name in name_counts:
-            name_counts[name] += 1
-            mesh.name = f"{name}_{name_counts[name]}"
-        else:
-            name_counts[name] = 1
-
-
-# =============================================================================
-# Polyscope Visualization
-# =============================================================================
-
-def setup_polyscope(up_direction: str = "z_up") -> None:
-    """
-    Initialize polyscope with standard settings.
-    
-    Args:
-        up_direction: Up direction ("z_up", "y_up", etc.)
-    """
-    import polyscope as ps
-    ps.init()
-    ps.set_up_dir(up_direction)
-
-
-def register_meshes_with_polyscope(
-    meshes: list[MeshData],
-    default_color: tuple[float, float, float] = (0.7, 0.7, 0.7),
-    verbose: bool = False
-) -> None:
-    """
-    Register a list of meshes with polyscope for visualization.
-    
-    Uses material color if available, falls back to display color,
-    then to the default color.
-    
-    Args:
-        meshes: List of MeshData objects
-        default_color: Color to use if mesh has no color information
-        verbose: If True, print which color source is used
-    """
-    import polyscope as ps
-    
-    for mesh in meshes:
-        pm = ps.register_surface_mesh(mesh.name, mesh.vertices, mesh.faces)
-        
-        try:
-            color = mesh.get_color()
-            
-            if color is not None:
-                if verbose:
-                    source = "material" if mesh.material_color else "display"
-                    print(f"  {mesh.name}: using {source} color {color}")
-                pm.set_color(color)
-            else:
-                if verbose:
-                    print(f"  {mesh.name}: using default color")
-                pm.set_color(default_color)
-                
-        except Exception as e:
-            print(f"WARNING: failed to set color for mesh {mesh.name}: {e}")
-            pm.set_color(default_color)
-
-
-def show_polyscope() -> None:
-    """Show the polyscope viewer (blocking)."""
-    import polyscope as ps
-    ps.show()
-
-
-# =============================================================================
-# High-Level Convenience Functions
-# =============================================================================
-
-def load_and_visualize_usd(
-    usd_path: str,
-    time_code: Usd.TimeCode | None = None,
-    path_filter: Callable[[str], bool] | None = None,
-    load_textures: bool = False,
-    up_direction: str = "z_up",
-    verbose: bool = True
-) -> list[MeshData]:
-    """
-    High-level function to load a USD file and visualize it with polyscope.
-    
-    Args:
-        usd_path: Path to the USD file
-        time_code: USD time code for sampling (default: Usd.TimeCode.Default())
-        path_filter: Optional filter function for prim paths
-        load_textures: If True, sample textures for material colors
-        up_direction: Polyscope up direction
-        verbose: If True, print progress information
-        
-    Returns:
-        List of loaded MeshData objects
-    """
-    if verbose:
-        print(f"Loading: {usd_path}")
-    
-    stage = Usd.Stage.Open(usd_path)
-    if not stage:
-        raise RuntimeError(f"Failed to open USD file: {usd_path}")
-    
-    options = MeshLoadOptions(
-        time_code=time_code or Usd.TimeCode.Default(),
-        load_material_colors=True,
-        load_texture_colors=load_textures,
-        path_filter=path_filter,
-        skip_invisible=True,
-        skip_proxy=True
-    )
-    
-    meshes = load_meshes_from_stage(stage, usd_path, options, verbose=verbose)
-    
-    if verbose:
-        print(f"\nFound {len(meshes)} meshes")
-    
-    if not meshes:
-        if verbose:
-            print("No meshes found matching criteria.")
-        return meshes
-    
-    make_mesh_names_unique(meshes)
-    
-    setup_polyscope(up_direction)
-    register_meshes_with_polyscope(meshes, verbose=verbose)
-    
-    if verbose:
-        print("\nPolyscope viewer opened. Close window to exit.")
-    
-    show_polyscope()
-    
-    return meshes
 

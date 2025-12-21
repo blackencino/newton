@@ -3,7 +3,11 @@
 """
 Render all visible meshes in USD scene using the TD060 camera.
 
-Uses ces26_utils for mesh and camera loading.
+Uses the Diegetic functional pipeline from ces26_utils:
+1. parse_diegetics: Folds geometry + color extractors over USD stage
+2. setup_diegetic_render_context: Converts Diegetics to GPU-ready structures
+3. render_and_save_frame: Renders from camera and saves to disk
+
 Renders at 4K resolution (3840x2160) with object ID colors.
 
 Usage: uv run python newton/examples/ces26/debug_all_visible_camera.py
@@ -14,15 +18,18 @@ from pathlib import Path
 from pxr import Usd
 
 from ces26_utils import (
-    MeshLoadOptions,
+    ColorChannel,
+    ParseOptions,
     RenderConfig,
     get_camera_from_stage,
-    load_meshes_from_stage,
-    make_mesh_names_unique,
+    make_diegetic_names_unique,
+    material_diffuse_extractor,
     open_usd_stage,
+    parse_diegetics,
+    primvar_color,
+    random_color,
     render_and_save_frame,
     setup_render_context,
-    use_object_id_colors,
 )
 
 # =============================================================================
@@ -40,27 +47,22 @@ RENDER_CONFIG = RenderConfig(
     filename_pattern="debug_all_visible_camera.{frame}.png",
 )
 
-
 # =============================================================================
-# Scene Building
+# Color Extractor Configuration
 # =============================================================================
 
-def load_all_visible_meshes(stage: Usd.Stage, usd_path: str, time_code: Usd.TimeCode):
-    """Load all visible meshes using ces26_utils (no name filtering)."""
-    options = MeshLoadOptions(
-        time_code=time_code,
-        load_material_colors=False,
-        load_texture_colors=False,
-        path_filter=None,  # No filtering - load all visible meshes
-        skip_invisible=True,
-        skip_proxy=True
-    )
-    
-    meshes = load_meshes_from_stage(stage, usd_path, options, verbose=False)
-    make_mesh_names_unique(meshes)
-    
-    print(f"Loaded {len(meshes)} visible meshes")
-    return meshes
+# Define extractors for each color channel
+DIFFUSE_EXTRACTOR = material_diffuse_extractor(
+    fallback=(0.7, 0.7, 0.7),
+    load_textures=False,
+)
+
+OBJECT_ID_EXTRACTOR = primvar_color(
+    primvar_name="objectid_color",
+    fallback=(1.0, 0.5, 0.0),  # Bright orange for missing object IDs
+)
+
+SEMANTIC_EXTRACTOR = random_color(seed=42)
 
 
 # =============================================================================
@@ -70,19 +72,38 @@ def load_all_visible_meshes(stage: Usd.Stage, usd_path: str, time_code: Usd.Time
 def main():
     stage = open_usd_stage(USD_FILE)
 
-    # Phase 1: Build scene representation (data loading, color assignment)
-    meshes = load_all_visible_meshes(stage, USD_FILE, Usd.TimeCode(FRAMES[0]))
+    # Phase 1: Parse USD into Diegetics (geometry + all color channels)
+    options = ParseOptions(
+        time_code=Usd.TimeCode(FRAMES[0]),
+        path_filter=None,  # Load all visible meshes
+        skip_invisible=True,
+        skip_proxy=True,
+    )
     
-    if not meshes:
-        print("No meshes found!")
+    diegetics = parse_diegetics(
+        stage=stage,
+        usd_file_path=USD_FILE,
+        options=options,
+        diffuse_extractor=DIFFUSE_EXTRACTOR,
+        object_id_extractor=OBJECT_ID_EXTRACTOR,
+        semantic_extractor=SEMANTIC_EXTRACTOR,
+        verbose=False,
+    )
+    
+    if not diegetics:
+        print("No diegetics found!")
         return
+    
+    # Make names unique (returns new list since Diegetic is frozen)
+    diegetics = make_diegetic_names_unique(diegetics)
+    print(f"Loaded {len(diegetics)} diegetics")
 
-    # Convert meshes to scene shapes with object ID colors from primvars
-    # Meshes missing primvars:objectid_color will appear in bright orange (error color)
-    shapes = use_object_id_colors(meshes)
-
-    # Phase 2: Convert scene representation to render context
-    ctx, _ = setup_render_context(shapes, RENDER_CONFIG)
+    # Phase 2: Setup render context with object_id colors
+    ctx, _ = setup_render_context(
+        diegetics,
+        RENDER_CONFIG,
+        channel=ColorChannel.OBJECT_ID,
+    )
 
     # Phase 3: Render frames
     for frame in FRAMES:
@@ -95,4 +116,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
