@@ -10,7 +10,8 @@ Uses the Diegetic functional pipeline from ces26_utils with multi-AOV output:
 
 Outputs files named {base}_{AOV}.{frame:04d}.png:
 - debug_all_visible_color.2920.png: Lit diffuse render
-- debug_all_visible_depth.2920.png: Depth visualization (closer = brighter)
+- debug_all_visible_depth.2920.png: Depth visualization (grayscale, closer = brighter)
+- debug_all_visible_depth_heat.2920.png: Depth heat map (viridis or magma colormap)
 - debug_all_visible_normal.2920.png: Surface normal visualization
 - debug_all_visible_object_id.2920.png: Object ID colors (from USD primvar)
 - debug_all_visible_semantic.2920.png: Semantic segmentation colors (random per-object)
@@ -25,6 +26,7 @@ from pathlib import Path
 from pxr import Usd
 
 from ces26_utils import (
+    DepthColormap,
     ParseOptions,
     RenderConfig,
     get_camera_from_stage,
@@ -45,6 +47,9 @@ from ces26_utils import (
 USD_FILE = r"C:\Users\chorvath\Downloads\20251220_iv060_flat_02\Collected_20251220_iv060_flat_02\20251220_iv060_flat_02.usd"
 CAMERA_PATH = "/World/TD060"
 FRAMES = [2920, 3130]
+
+# Depth heat map colormap: try MAGMA (warm) or VIRIDIS (cool-to-warm)
+DEPTH_COLORMAP = DepthColormap.MAGMA  # or DepthColormap.VIRIDIS
 
 RENDER_CONFIG = RenderConfig(
     width=3840,
@@ -120,6 +125,7 @@ def main():
             config=RENDER_CONFIG,
             frame_num=frame,
             base_name="debug_all_visible",
+            depth_colormap=DEPTH_COLORMAP,
         )
 
     print("\nDone!")

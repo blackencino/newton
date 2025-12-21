@@ -78,11 +78,163 @@ class PixelOutputs:
     
     All arrays are (height, width, 3) uint8 RGB format.
     """
-    color: np.ndarray      # Lit diffuse render
-    depth: np.ndarray      # Depth visualization (grayscale as RGB)
-    normal: np.ndarray     # Normal visualization ((n+1)/2 mapped to 0-255)
-    object_id: np.ndarray  # Object ID colors
-    semantic: np.ndarray   # Semantic colors
+    color: np.ndarray       # Lit diffuse render
+    depth: np.ndarray       # Depth visualization (grayscale as RGB)
+    depth_heat: np.ndarray  # Depth visualization (colormap false-color)
+    normal: np.ndarray      # Normal visualization ((n+1)/2 mapped to 0-255)
+    object_id: np.ndarray   # Object ID colors
+    semantic: np.ndarray    # Semantic colors
+
+
+# =============================================================================
+# Colormaps for Depth Visualization
+# =============================================================================
+
+class DepthColormap:
+    """Enum-like class for depth colormap options."""
+    VIRIDIS = "viridis"
+    MAGMA = "magma"
+
+
+# Viridis colormap - 256 entries, RGB 0-255
+# Source: matplotlib viridis
+_VIRIDIS_DATA = [
+    (68, 1, 84), (68, 2, 86), (69, 4, 87), (69, 5, 89), (70, 7, 90),
+    (70, 8, 92), (70, 10, 93), (70, 11, 94), (71, 13, 96), (71, 14, 97),
+    (71, 16, 99), (71, 17, 100), (71, 19, 101), (72, 20, 103), (72, 22, 104),
+    (72, 23, 105), (72, 24, 106), (72, 26, 108), (72, 27, 109), (72, 28, 110),
+    (72, 29, 111), (72, 31, 112), (72, 32, 113), (72, 33, 115), (72, 35, 116),
+    (72, 36, 117), (72, 37, 118), (72, 38, 119), (72, 40, 120), (72, 41, 121),
+    (71, 42, 122), (71, 44, 122), (71, 45, 123), (71, 46, 124), (71, 47, 125),
+    (70, 48, 126), (70, 50, 126), (70, 51, 127), (69, 52, 128), (69, 53, 129),
+    (69, 55, 129), (68, 56, 130), (68, 57, 131), (68, 58, 131), (67, 60, 132),
+    (67, 61, 132), (66, 62, 133), (66, 63, 133), (66, 64, 134), (65, 66, 134),
+    (65, 67, 135), (64, 68, 135), (64, 69, 136), (63, 71, 136), (63, 72, 137),
+    (62, 73, 137), (62, 74, 137), (62, 76, 138), (61, 77, 138), (61, 78, 138),
+    (60, 79, 139), (60, 80, 139), (59, 82, 139), (59, 83, 140), (58, 84, 140),
+    (58, 85, 140), (57, 86, 141), (57, 88, 141), (56, 89, 141), (56, 90, 141),
+    (55, 91, 142), (55, 92, 142), (54, 94, 142), (54, 95, 142), (53, 96, 142),
+    (53, 97, 143), (52, 98, 143), (52, 100, 143), (51, 101, 143), (51, 102, 143),
+    (50, 103, 143), (50, 104, 144), (49, 106, 144), (49, 107, 144), (49, 108, 144),
+    (48, 109, 144), (48, 110, 144), (47, 111, 144), (47, 113, 144), (46, 114, 144),
+    (46, 115, 144), (45, 116, 144), (45, 117, 144), (45, 118, 144), (44, 120, 144),
+    (44, 121, 144), (43, 122, 144), (43, 123, 144), (43, 124, 144), (42, 125, 144),
+    (42, 126, 144), (42, 128, 144), (41, 129, 144), (41, 130, 143), (40, 131, 143),
+    (40, 132, 143), (40, 133, 143), (39, 134, 143), (39, 136, 143), (39, 137, 142),
+    (38, 138, 142), (38, 139, 142), (38, 140, 142), (37, 141, 141), (37, 142, 141),
+    (37, 144, 141), (36, 145, 140), (36, 146, 140), (36, 147, 140), (36, 148, 139),
+    (35, 149, 139), (35, 150, 138), (35, 152, 138), (35, 153, 137), (35, 154, 137),
+    (34, 155, 136), (34, 156, 136), (34, 157, 135), (34, 158, 135), (34, 160, 134),
+    (34, 161, 133), (34, 162, 133), (34, 163, 132), (34, 164, 131), (34, 165, 131),
+    (34, 166, 130), (34, 168, 129), (34, 169, 128), (35, 170, 128), (35, 171, 127),
+    (35, 172, 126), (36, 173, 125), (36, 174, 124), (37, 176, 124), (37, 177, 123),
+    (38, 178, 122), (38, 179, 121), (39, 180, 120), (40, 181, 119), (40, 182, 118),
+    (41, 183, 117), (42, 184, 116), (43, 186, 115), (44, 187, 114), (45, 188, 113),
+    (46, 189, 112), (47, 190, 111), (48, 191, 110), (49, 192, 109), (50, 193, 108),
+    (52, 194, 106), (53, 195, 105), (54, 196, 104), (56, 197, 103), (57, 198, 101),
+    (59, 199, 100), (60, 200, 99), (62, 201, 97), (63, 202, 96), (65, 203, 95),
+    (67, 203, 93), (69, 204, 92), (70, 205, 90), (72, 206, 89), (74, 207, 87),
+    (76, 208, 86), (78, 209, 84), (80, 209, 83), (82, 210, 81), (84, 211, 79),
+    (86, 212, 78), (88, 212, 76), (90, 213, 74), (92, 214, 73), (94, 214, 71),
+    (97, 215, 69), (99, 216, 68), (101, 216, 66), (103, 217, 64), (105, 218, 62),
+    (108, 218, 60), (110, 219, 59), (112, 219, 57), (115, 220, 55), (117, 221, 53),
+    (119, 221, 51), (122, 222, 49), (124, 222, 47), (127, 223, 45), (129, 223, 43),
+    (132, 224, 41), (134, 224, 39), (137, 225, 37), (139, 225, 35), (142, 225, 33),
+    (144, 226, 31), (147, 226, 29), (149, 227, 27), (152, 227, 25), (155, 227, 23),
+    (157, 228, 21), (160, 228, 19), (162, 228, 18), (165, 229, 16), (168, 229, 14),
+    (170, 229, 13), (173, 229, 11), (176, 230, 10), (178, 230, 9), (181, 230, 8),
+    (184, 230, 7), (186, 230, 7), (189, 231, 6), (192, 231, 6), (194, 231, 6),
+    (197, 231, 6), (200, 231, 6), (202, 231, 7), (205, 231, 7), (208, 231, 8),
+    (210, 231, 9), (213, 231, 10), (215, 231, 11), (218, 231, 12), (221, 231, 14),
+    (223, 230, 15), (226, 230, 17), (228, 230, 18), (231, 230, 20), (233, 229, 22),
+    (236, 229, 24), (238, 229, 26), (240, 228, 28), (243, 228, 30), (245, 227, 32),
+    (247, 227, 34), (249, 226, 37), (251, 226, 39), (253, 225, 41),
+]
+
+# Magma colormap - 256 entries, RGB 0-255
+# Source: matplotlib magma
+_MAGMA_DATA = [
+    (0, 0, 4), (1, 0, 5), (1, 1, 6), (1, 1, 8), (2, 1, 9),
+    (2, 2, 11), (2, 2, 13), (3, 3, 15), (3, 3, 18), (4, 4, 20),
+    (5, 4, 22), (6, 5, 24), (6, 5, 26), (7, 6, 28), (8, 7, 30),
+    (9, 7, 32), (10, 8, 34), (11, 9, 36), (12, 9, 38), (13, 10, 41),
+    (14, 11, 43), (16, 11, 45), (17, 12, 47), (18, 13, 49), (19, 13, 52),
+    (20, 14, 54), (21, 14, 56), (22, 15, 59), (24, 15, 61), (25, 16, 63),
+    (26, 16, 66), (28, 16, 68), (29, 17, 71), (30, 17, 73), (32, 17, 75),
+    (33, 17, 78), (34, 17, 80), (36, 18, 83), (37, 18, 85), (39, 18, 88),
+    (41, 17, 90), (42, 17, 92), (44, 17, 95), (45, 17, 97), (47, 17, 99),
+    (49, 17, 101), (51, 16, 103), (52, 16, 105), (54, 16, 107), (56, 16, 108),
+    (57, 15, 110), (59, 15, 112), (61, 15, 113), (63, 15, 114), (64, 15, 116),
+    (66, 15, 117), (68, 15, 118), (69, 16, 119), (71, 16, 120), (73, 16, 120),
+    (74, 16, 121), (76, 17, 122), (78, 17, 123), (79, 18, 123), (81, 18, 124),
+    (82, 19, 124), (84, 19, 125), (86, 20, 125), (87, 21, 126), (89, 21, 126),
+    (90, 22, 126), (92, 22, 127), (93, 23, 127), (95, 24, 127), (96, 24, 128),
+    (98, 25, 128), (100, 26, 128), (101, 26, 128), (103, 27, 128), (104, 28, 129),
+    (106, 28, 129), (107, 29, 129), (109, 30, 129), (110, 30, 129), (112, 31, 129),
+    (114, 32, 129), (115, 32, 129), (117, 33, 129), (118, 34, 129), (120, 34, 129),
+    (121, 35, 129), (123, 36, 129), (124, 36, 129), (126, 37, 129), (127, 38, 129),
+    (129, 38, 129), (130, 39, 129), (132, 40, 129), (133, 40, 129), (135, 41, 128),
+    (136, 42, 128), (138, 42, 128), (140, 43, 128), (141, 44, 127), (143, 44, 127),
+    (144, 45, 127), (146, 46, 126), (147, 46, 126), (149, 47, 126), (150, 48, 125),
+    (152, 48, 125), (153, 49, 124), (155, 50, 124), (156, 51, 123), (158, 51, 123),
+    (160, 52, 122), (161, 53, 122), (163, 53, 121), (164, 54, 121), (166, 55, 120),
+    (167, 56, 119), (169, 56, 119), (170, 57, 118), (172, 58, 117), (173, 58, 117),
+    (175, 59, 116), (176, 60, 115), (178, 61, 114), (179, 61, 114), (181, 62, 113),
+    (182, 63, 112), (184, 64, 111), (185, 64, 110), (187, 65, 110), (188, 66, 109),
+    (189, 67, 108), (191, 68, 107), (192, 68, 106), (194, 69, 105), (195, 70, 104),
+    (196, 71, 103), (198, 72, 102), (199, 72, 101), (200, 73, 100), (202, 74, 99),
+    (203, 75, 98), (204, 76, 97), (205, 77, 96), (207, 78, 95), (208, 79, 94),
+    (209, 80, 93), (210, 81, 92), (211, 82, 91), (212, 83, 90), (214, 84, 89),
+    (215, 85, 88), (216, 86, 87), (217, 87, 85), (218, 88, 84), (219, 89, 83),
+    (220, 90, 82), (221, 91, 81), (222, 93, 80), (223, 94, 79), (224, 95, 78),
+    (225, 96, 76), (226, 97, 75), (227, 99, 74), (228, 100, 73), (228, 101, 72),
+    (229, 102, 71), (230, 104, 70), (231, 105, 68), (231, 106, 67), (232, 108, 66),
+    (233, 109, 65), (233, 111, 64), (234, 112, 63), (235, 114, 62), (235, 115, 60),
+    (236, 117, 59), (236, 118, 58), (237, 120, 57), (237, 121, 56), (238, 123, 55),
+    (238, 125, 54), (239, 126, 53), (239, 128, 52), (240, 130, 51), (240, 131, 50),
+    (240, 133, 49), (241, 135, 48), (241, 137, 47), (241, 138, 46), (242, 140, 45),
+    (242, 142, 45), (242, 144, 44), (243, 146, 43), (243, 147, 43), (243, 149, 42),
+    (243, 151, 42), (244, 153, 41), (244, 155, 41), (244, 157, 40), (244, 159, 40),
+    (244, 161, 40), (245, 163, 40), (245, 165, 40), (245, 167, 40), (245, 168, 40),
+    (245, 170, 40), (245, 172, 41), (246, 174, 41), (246, 176, 42), (246, 178, 42),
+    (246, 180, 43), (246, 182, 44), (246, 184, 45), (246, 186, 46), (246, 188, 47),
+    (246, 190, 48), (246, 192, 50), (246, 194, 51), (246, 196, 53), (246, 198, 54),
+    (246, 200, 56), (247, 202, 58), (247, 204, 60), (247, 205, 62), (247, 207, 64),
+    (247, 209, 66), (247, 211, 68), (247, 213, 70), (247, 215, 73), (247, 217, 75),
+    (248, 219, 77), (248, 221, 80), (248, 223, 82), (248, 225, 85), (248, 227, 88),
+    (249, 229, 90), (249, 230, 93), (249, 232, 96), (249, 234, 99), (250, 236, 102),
+    (250, 238, 105), (250, 240, 108), (251, 242, 111), (251, 244, 115), (252, 246, 118),
+    (252, 247, 121), (253, 249, 125), (253, 251, 128),
+]
+
+def _build_colormap_lut(colormap_data: list[tuple[int, int, int]]) -> wp.array:
+    """Build a warp array LUT from colormap data."""
+    packed = np.array([
+        (0xFF << 24) | (b << 16) | (g << 8) | r
+        for r, g, b in colormap_data
+    ], dtype=np.uint32)
+    return wp.array(packed, dtype=wp.uint32)
+
+
+# Pre-built colormap LUTs (created lazily)
+_viridis_lut: wp.array | None = None
+_magma_lut: wp.array | None = None
+
+
+def get_colormap_lut(colormap: str) -> wp.array:
+    """Get the warp array LUT for a colormap."""
+    global _viridis_lut, _magma_lut
+    
+    if colormap == DepthColormap.VIRIDIS:
+        if _viridis_lut is None:
+            _viridis_lut = _build_colormap_lut(_VIRIDIS_DATA)
+        return _viridis_lut
+    elif colormap == DepthColormap.MAGMA:
+        if _magma_lut is None:
+            _magma_lut = _build_colormap_lut(_MAGMA_DATA)
+        return _magma_lut
+    else:
+        raise ValueError(f"Unknown colormap: {colormap}")
 
 
 # =============================================================================
@@ -173,6 +325,36 @@ def find_depth_range(
     if depth > 0.0:
         wp.atomic_min(depth_range, 0, depth)
         wp.atomic_max(depth_range, 1, depth)
+
+
+@wp.kernel
+def depth_to_colormap(
+    depth_image: wp.array(dtype=wp.float32, ndim=3),
+    min_depth: wp.float32,
+    max_depth: wp.float32,
+    colormap_lut: wp.array(dtype=wp.uint32),
+    out_rgba: wp.array(dtype=wp.uint32, ndim=3),
+):
+    """Convert depth values to colormap visualization (closer = warm, far = cool for magma)."""
+    world_id, camera_id, pixel_id = wp.tid()
+    depth = depth_image[world_id, camera_id, pixel_id]
+    
+    if depth <= 0.0:
+        # No hit - dark gray background
+        out_rgba[world_id, camera_id, pixel_id] = wp.uint32(0xFF404040)
+        return
+    
+    # Normalize depth to 0-1, invert so closer = higher value (brighter/warmer)
+    denom = wp.max(max_depth - min_depth, 0.001)
+    normalized = (depth - min_depth) / denom
+    inverted = 1.0 - normalized  # Invert: closer = 1, far = 0
+    
+    # Map to colormap index (0-255)
+    lut_size = colormap_lut.shape[0]
+    index = wp.int32(inverted * wp.float32(lut_size - 1))
+    index = wp.clamp(index, 0, lut_size - 1)
+    
+    out_rgba[world_id, camera_id, pixel_id] = colormap_lut[index]
 
 
 # =============================================================================
@@ -1067,6 +1249,7 @@ def convert_aovs_to_pixels(
     outputs: RenderOutputs,
     color_luts: ColorLUTs,
     config: RenderConfig,
+    depth_colormap: str = DepthColormap.MAGMA,
 ) -> PixelOutputs:
     """
     Convert raw GPU render outputs to numpy RGB arrays for saving.
@@ -1077,6 +1260,7 @@ def convert_aovs_to_pixels(
         outputs: Raw RenderOutputs from render_all_aovs
         color_luts: ColorLUTs for object_id and semantic mapping
         config: Render configuration (for dimensions)
+        depth_colormap: Colormap for depth_heat pass (DepthColormap.VIRIDIS or .MAGMA)
         
     Returns:
         PixelOutputs with all passes as (height, width, 3) uint8 arrays
@@ -1088,7 +1272,7 @@ def convert_aovs_to_pixels(
         outputs.color_image.numpy()[0, 0], height, width
     )
     
-    # Depth pass - normalize and convert to grayscale
+    # Compute depth range once (used by both depth passes)
     depth_range = wp.array([1e10, 0.0], dtype=wp.float32)
     wp.launch(
         find_depth_range,
@@ -1097,6 +1281,7 @@ def convert_aovs_to_pixels(
     )
     depth_range_np = depth_range.numpy()
     
+    # Depth pass - grayscale
     depth_rgba = wp.zeros_like(outputs.color_image)
     wp.launch(
         depth_to_grayscale,
@@ -1104,6 +1289,16 @@ def convert_aovs_to_pixels(
         [outputs.depth_image, depth_range_np[0], depth_range_np[1], depth_rgba],
     )
     depth_rgb = packed_uint32_to_rgb(depth_rgba.numpy()[0, 0], height, width)
+    
+    # Depth heat pass - colormap visualization
+    colormap_lut = get_colormap_lut(depth_colormap)
+    depth_heat_rgba = wp.zeros_like(outputs.color_image)
+    wp.launch(
+        depth_to_colormap,
+        outputs.depth_image.shape,
+        [outputs.depth_image, depth_range_np[0], depth_range_np[1], colormap_lut, depth_heat_rgba],
+    )
+    depth_heat_rgb = packed_uint32_to_rgb(depth_heat_rgba.numpy()[0, 0], height, width)
     
     # Normal pass - convert normals to RGB
     normal_rgba = wp.zeros_like(outputs.color_image)
@@ -1135,6 +1330,7 @@ def convert_aovs_to_pixels(
     return PixelOutputs(
         color=color_rgb,
         depth=depth_rgb,
+        depth_heat=depth_heat_rgb,
         normal=normal_rgb,
         object_id=object_id_rgb,
         semantic=semantic_rgb,
@@ -1163,6 +1359,7 @@ def save_all_aovs(
     Creates files named {base}_{AOV}.{frame:04d}.{ext}:
     - {base}_color.0001.png
     - {base}_depth.0001.png
+    - {base}_depth_heat.0001.png
     - {base}_normal.0001.png
     - {base}_object_id.0001.png
     - {base}_semantic.0001.png
@@ -1181,6 +1378,7 @@ def save_all_aovs(
     
     save_pixels_to_png(pixel_outputs.color, aov_path("color"))
     save_pixels_to_png(pixel_outputs.depth, aov_path("depth"))
+    save_pixels_to_png(pixel_outputs.depth_heat, aov_path("depth_heat"))
     save_pixels_to_png(pixel_outputs.normal, aov_path("normal"))
     save_pixels_to_png(pixel_outputs.object_id, aov_path("object_id"))
     save_pixels_to_png(pixel_outputs.semantic, aov_path("semantic"))
@@ -1194,6 +1392,7 @@ def render_and_save_all_aovs(
     frame_num: int,
     base_name: str = "render",
     ext: str = "png",
+    depth_colormap: str = DepthColormap.MAGMA,
 ) -> PixelOutputs:
     """
     Render all AOVs and save them to disk.
@@ -1209,6 +1408,7 @@ def render_and_save_all_aovs(
         frame_num: Frame number for filename (formatted as 4-digit zero-padded)
         base_name: Base filename (before the AOV suffix)
         ext: File extension (default: "png")
+        depth_colormap: Colormap for depth_heat (DepthColormap.VIRIDIS or .MAGMA)
         
     Returns:
         PixelOutputs with all passes as numpy arrays
@@ -1219,7 +1419,7 @@ def render_and_save_all_aovs(
     outputs = render_all_aovs(ctx, camera, config)
     
     # Convert to pixels
-    pixel_outputs = convert_aovs_to_pixels(outputs, color_luts, config)
+    pixel_outputs = convert_aovs_to_pixels(outputs, color_luts, config, depth_colormap)
     
     # Save all passes
     save_all_aovs(pixel_outputs, config.output_dir, frame_num, base_name, ext)
