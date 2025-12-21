@@ -1,12 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 """
-Render USD scene using the TD060 camera from the USD file.
+Render all visible meshes in USD scene using the TD060 camera.
 
 Uses ces26_utils for mesh and camera loading.
-Handles USD camera coordinate system: X-right, Y-up, -Z forward (camera looks down -Z).
+Renders at 4K resolution (3840x2160) with object ID colors.
 
-Usage: uv run python newton/examples/ces26/debug_lantern_camera.py
+Usage: uv run python newton/examples/ces26/debug_all_visible_camera.py
 """
 
 from pathlib import Path
@@ -29,16 +29,15 @@ from ces26_utils import (
 # Configuration
 # =============================================================================
 
-#USD_FILE = r"C:\Users\chorvath\Downloads\20251219_iv060_flat_01\Collected_iv060_flat_01\iv060_flat_01.usd"
 USD_FILE = r"C:\Users\chorvath\Downloads\20251220_iv060_flat_02\Collected_20251220_iv060_flat_02\20251220_iv060_flat_02.usd"
 CAMERA_PATH = "/World/TD060"
 FRAMES = [2920, 3130]
 
 RENDER_CONFIG = RenderConfig(
-    width=960,
-    height=540,
+    width=3840,
+    height=2160,
     output_dir=Path(__file__).parent,
-    filename_pattern="debug_lantern_camera.{frame}.png",
+    filename_pattern="debug_all_visible_camera.{frame}.png",
 )
 
 
@@ -46,13 +45,13 @@ RENDER_CONFIG = RenderConfig(
 # Scene Building
 # =============================================================================
 
-def load_lantern_meshes(stage: Usd.Stage, usd_path: str, time_code: Usd.TimeCode):
-    """Load lantern meshes using ces26_utils."""
+def load_all_visible_meshes(stage: Usd.Stage, usd_path: str, time_code: Usd.TimeCode):
+    """Load all visible meshes using ces26_utils (no name filtering)."""
     options = MeshLoadOptions(
         time_code=time_code,
         load_material_colors=False,
         load_texture_colors=False,
-        path_filter=lambda path: "Hanging" in path,
+        path_filter=None,  # No filtering - load all visible meshes
         skip_invisible=True,
         skip_proxy=True
     )
@@ -60,7 +59,7 @@ def load_lantern_meshes(stage: Usd.Stage, usd_path: str, time_code: Usd.TimeCode
     meshes = load_meshes_from_stage(stage, usd_path, options, verbose=False)
     make_mesh_names_unique(meshes)
     
-    print(f"Loaded {len(meshes)} lantern meshes")
+    print(f"Loaded {len(meshes)} visible meshes")
     return meshes
 
 
@@ -72,7 +71,7 @@ def main():
     stage = open_usd_stage(USD_FILE)
 
     # Phase 1: Build scene representation (data loading, color assignment)
-    meshes = load_lantern_meshes(stage, USD_FILE, Usd.TimeCode(FRAMES[0]))
+    meshes = load_all_visible_meshes(stage, USD_FILE, Usd.TimeCode(FRAMES[0]))
     
     if not meshes:
         print("No meshes found!")
@@ -96,3 +95,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

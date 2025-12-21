@@ -905,6 +905,42 @@ def extract_object_id_color(
 # Mesh Loading
 # =============================================================================
 
+def open_usd_stage(usd_path: str, show_progress: bool = True) -> Usd.Stage:
+    """
+    Open a USD stage with progress messaging.
+    
+    Since Usd.Stage.Open() is a blocking call without progress callbacks,
+    this prints before/after messages so the user knows parsing is in progress.
+    
+    Args:
+        usd_path: Path to the USD file
+        show_progress: If True, print progress messages
+        
+    Returns:
+        Opened USD stage
+        
+    Raises:
+        RuntimeError: If the stage fails to open
+    """
+    import time
+    
+    if show_progress:
+        print(f"Opening USD stage: {usd_path}", flush=True)
+        print("  (This may take a while for large files...)", flush=True)
+    
+    start_time = time.time()
+    stage = Usd.Stage.Open(usd_path)
+    elapsed = time.time() - start_time
+    
+    if not stage:
+        raise RuntimeError(f"Failed to open USD file: {usd_path}")
+    
+    if show_progress:
+        print(f"  Stage opened in {elapsed:.1f}s", flush=True)
+    
+    return stage
+
+
 def is_proxy_path(path: str) -> bool:
     """Check if a prim path appears to be proxy geometry."""
     return "/proxy/" in path.lower()
@@ -914,7 +950,9 @@ def load_meshes_from_stage(
     stage: Usd.Stage,
     usd_file_path: str,
     options: MeshLoadOptions | None = None,
-    verbose: bool = False
+    verbose: bool = False,
+    show_progress: bool = True,
+    progress_interval: int = 1000
 ) -> list[MeshData]:
     """
     Load all visible mesh geometry from a USD stage.
@@ -929,10 +967,14 @@ def load_meshes_from_stage(
         usd_file_path: Path to the USD file (for resolving texture paths)
         options: MeshLoadOptions controlling what to load
         verbose: If True, print progress and debug information
+        show_progress: If True, print progress during traversal
+        progress_interval: Print progress every N prims processed
         
     Returns:
         List of MeshData objects with world-space geometry
     """
+    import sys
+    
     if options is None:
         options = MeshLoadOptions()
     
@@ -941,9 +983,19 @@ def load_meshes_from_stage(
     xcache = UsdGeom.XformCache(time_code)
     
     meshes_found = []
+    prims_processed = 0
+    meshes_skipped = 0
+    
+    if show_progress:
+        print("Traversing USD stage...", flush=True)
     
     # Traverse including instance proxies
     for prim in Usd.PrimRange(stage.GetPseudoRoot(), Usd.TraverseInstanceProxies()):
+        prims_processed += 1
+        
+        # Print progress periodically
+        if show_progress and prims_processed % progress_interval == 0:
+            print(f"  Processed {prims_processed} prims, found {len(meshes_found)} meshes...", flush=True)
         if not prim.IsA(UsdGeom.Mesh):
             continue
         
@@ -968,12 +1020,14 @@ def load_meshes_from_stage(
             if mesh.ComputeEffectiveVisibility(UsdGeom.Tokens.render, time_code) == UsdGeom.Tokens.invisible:
                 if verbose:
                     print(f"  SKIPPING (invisible): {path_str}")
+                meshes_skipped += 1
                 continue
         
         # Skip proxy meshes
         if options.skip_proxy and is_proxy_path(path_str):
             if verbose:
                 print(f"  SKIPPING (proxy): {path_str}")
+            meshes_skipped += 1
             continue
         
         # Extract geometry data
@@ -1033,6 +1087,9 @@ def load_meshes_from_stage(
         except Exception as e:
             if verbose:
                 print(f"  ERROR loading {path_str}: {e}")
+    
+    if show_progress:
+        print(f"  Done: {prims_processed} prims processed, {len(meshes_found)} meshes loaded, {meshes_skipped} skipped", flush=True)
     
     return meshes_found
 
