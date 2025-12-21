@@ -16,12 +16,12 @@ from pxr import Usd
 from ces26_utils import (
     MeshLoadOptions,
     RenderConfig,
-    assign_random_colors,
     get_camera_from_stage,
     load_meshes_from_stage,
     make_mesh_names_unique,
     render_and_save_frame,
     setup_render_context,
+    use_object_id_colors,
 )
 
 # =============================================================================
@@ -80,9 +80,9 @@ def main():
         print("No meshes found!")
         return
 
-    # Convert meshes to scene shapes with colors assigned
-    # Use assign_random_colors for debug visualization, or use_mesh_colors for USD colors
-    shapes = assign_random_colors(meshes, seed=42)
+    # Convert meshes to scene shapes with object ID colors from primvars
+    # Meshes missing primvars:objectid_color will appear in bright orange (error color)
+    shapes = use_object_id_colors(meshes)
 
     # Phase 2: Convert scene representation to render context
     ctx, _ = setup_render_context(shapes, RENDER_CONFIG)

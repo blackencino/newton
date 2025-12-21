@@ -48,6 +48,7 @@ class MeshData:
     faces: np.ndarray  # Triangle indices (M, 3)
     display_color: tuple[float, float, float] | None = None
     material_color: tuple[float, float, float] | None = None
+    object_id_color: tuple[float, float, float] | None = None  # From primvars:objectid_color
     
     def get_color(self) -> tuple[float, float, float] | None:
         """Return the best available color (material preferred over display)."""
@@ -353,6 +354,42 @@ def use_mesh_colors(
             color = (mesh_color[0], mesh_color[1], mesh_color[2], 1.0)
         else:
             color = fallback_color
+        
+        shapes.append(SceneShape(
+            vertices=mesh.vertices.astype(np.float32),
+            faces=mesh.faces,
+            color=color,
+            name=mesh.name,
+        ))
+    
+    return shapes
+
+
+def use_object_id_colors(
+    meshes: list[MeshData],
+    error_color: tuple[float, float, float, float] = (1.0, 0.5, 0.0, 1.0)
+) -> list[SceneShape]:
+    """
+    Convert MeshData to SceneShapes using object_id_color from primvars.
+    
+    Uses the object_id_color field read from primvars:objectid_color.
+    If a mesh doesn't have a valid object_id_color, uses the error_color
+    (bright orange by default) to make missing data visually obvious.
+    
+    Args:
+        meshes: List of MeshData objects to convert
+        error_color: RGBA color to use when object_id_color is missing (default: bright orange)
+        
+    Returns:
+        List of SceneShape objects ready for rendering
+    """
+    shapes = []
+    
+    for mesh in meshes:
+        if mesh.object_id_color is not None:
+            color = (mesh.object_id_color[0], mesh.object_id_color[1], mesh.object_id_color[2], 1.0)
+        else:
+            color = error_color
         
         shapes.append(SceneShape(
             vertices=mesh.vertices.astype(np.float32),
@@ -805,6 +842,65 @@ def extract_display_color(
                 float(display_color_primvar[2]))
 
 
+def extract_object_id_color(
+    prim: Usd.Prim,
+    time_code: Usd.TimeCode,
+    verbose: bool = False
+) -> tuple[float, float, float] | None:
+    """
+    Extract object ID color from primvars:objectid_color on a prim.
+    
+    Expects a constant (uniform) color3f primvar. Returns None if the primvar
+    doesn't exist, is not constant interpolation, or has invalid data.
+    
+    Args:
+        prim: The USD prim to read from
+        time_code: USD time code for sampling
+        verbose: If True, print debug information
+        
+    Returns:
+        tuple (r, g, b) or None if primvar missing/invalid
+    """
+    primvars_api = UsdGeom.PrimvarsAPI(prim)
+    primvar = primvars_api.GetPrimvar("objectid_color")
+    
+    if not primvar or not primvar.HasValue():
+        if verbose:
+            print(f"      No objectid_color primvar on {prim.GetPath()}")
+        return None
+    
+    # Check interpolation - we expect constant (one color for the whole mesh)
+    interpolation = primvar.GetInterpolation()
+    if interpolation != UsdGeom.Tokens.constant:
+        if verbose:
+            print(f"      objectid_color has interpolation '{interpolation}', expected 'constant'")
+        return None
+    
+    # Get the value
+    value = primvar.Get(time_code)
+    if value is None:
+        if verbose:
+            print(f"      objectid_color primvar has no value at {time_code}")
+        return None
+    
+    # Handle different value types
+    try:
+        if hasattr(value, '__getitem__') and len(value) >= 3:
+            # Vec3f, tuple, or similar
+            color = (float(value[0]), float(value[1]), float(value[2]))
+            if verbose:
+                print(f"      objectid_color: ({color[0]:.3f}, {color[1]:.3f}, {color[2]:.3f})")
+            return color
+        else:
+            if verbose:
+                print(f"      objectid_color has unexpected type: {type(value)}")
+            return None
+    except (TypeError, IndexError) as e:
+        if verbose:
+            print(f"      Failed to extract objectid_color: {e}")
+        return None
+
+
 # =============================================================================
 # Mesh Loading
 # =============================================================================
@@ -901,6 +997,7 @@ def load_meshes_from_stage(
             # Get colors
             display_color = None
             material_color = None
+            object_id_color = None
             
             display_color_raw = mesh.GetDisplayColorPrimvar().Get(time_code)
             display_color = extract_display_color(display_color_raw)
@@ -914,13 +1011,17 @@ def load_meshes_from_stage(
                     verbose=verbose
                 )
             
+            # Extract object ID color from primvar
+            object_id_color = extract_object_id_color(geom_prim, time_code, verbose=verbose)
+            
             mesh_data = MeshData(
                 name=path_str.split("/")[-1],
                 path=path_str,
                 vertices=pts_world,
                 faces=tris,
                 display_color=display_color,
-                material_color=material_color
+                material_color=material_color,
+                object_id_color=object_id_color,
             )
             
             if verbose:
