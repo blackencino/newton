@@ -18,6 +18,7 @@ import glob
 import os
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
 
 import numpy as np
@@ -279,6 +280,221 @@ def transforms_and_rays_from_camera_data(camera: CameraData, width: int, height:
     return camera_transforms, camera_rays
 
 
+# =============================================================================
+# Render Configuration & Scene Representation
+# =============================================================================
+
+@dataclass(frozen=True)
+class RenderConfig:
+    """Immutable configuration for rendering output."""
+    width: int
+    height: int
+    output_dir: Path
+    filename_pattern: str = "render.{frame}.png"
+    
+    def get_output_path(self, frame: int) -> Path:
+        """Get the full output path for a given frame number."""
+        return self.output_dir / self.filename_pattern.format(frame=frame)
+
+
+@dataclass(frozen=True)
+class SceneShape:
+    """Immutable representation of a renderable shape in the scene."""
+    vertices: np.ndarray  # (N, 3) float32
+    faces: np.ndarray     # (M, 3) int32
+    color: tuple[float, float, float, float]  # RGBA
+    name: str = ""
+
+
+# =============================================================================
+# Scene Building (MeshData -> SceneShape conversion)
+# =============================================================================
+
+def assign_random_colors(meshes: list[MeshData], seed: int = 42) -> list[SceneShape]:
+    """
+    Convert MeshData to SceneShapes with random colors.
+    
+    Colors are assigned deterministically based on the seed.
+    If a mesh has a color from USD, we could use it here instead;
+    this function specifically randomizes for debugging/visualization.
+    """
+    rng = np.random.default_rng(seed)
+    shapes = []
+    
+    for mesh in meshes:
+        # Random color in range [0.5, 1.0] for visibility
+        rgb = rng.random(3).astype(np.float32) * 0.5 + 0.5
+        color = (float(rgb[0]), float(rgb[1]), float(rgb[2]), 1.0)
+        
+        shapes.append(SceneShape(
+            vertices=mesh.vertices.astype(np.float32),
+            faces=mesh.faces,
+            color=color,
+            name=mesh.name,
+        ))
+    
+    return shapes
+
+
+def use_mesh_colors(
+    meshes: list[MeshData],
+    fallback_color: tuple[float, float, float, float] = (0.7, 0.7, 0.7, 1.0)
+) -> list[SceneShape]:
+    """
+    Convert MeshData to SceneShapes using colors extracted from USD.
+    
+    Uses material_color if available, then display_color, then fallback.
+    """
+    shapes = []
+    
+    for mesh in meshes:
+        mesh_color = mesh.get_color()
+        if mesh_color is not None:
+            color = (mesh_color[0], mesh_color[1], mesh_color[2], 1.0)
+        else:
+            color = fallback_color
+        
+        shapes.append(SceneShape(
+            vertices=mesh.vertices.astype(np.float32),
+            faces=mesh.faces,
+            color=color,
+            name=mesh.name,
+        ))
+    
+    return shapes
+
+
+# =============================================================================
+# Rendering (Scene -> Pixels)
+# =============================================================================
+
+def setup_render_context(shapes: list[SceneShape], config: RenderConfig) -> tuple[RenderContext, list]:
+    """
+    Create and configure RenderContext from scene shapes.
+    
+    This function converts the geometric scene representation into the 
+    internal structures needed by the renderer. All scene data (geometry,
+    colors, transforms) should be fully specified in the input shapes.
+    
+    Returns:
+        Tuple of (RenderContext, list of warp.Mesh objects)
+    """
+    num_shapes = len(shapes)
+    print(f"Setting up render context with {num_shapes} shapes...")
+
+    warp_meshes = []
+    mesh_bounds = np.zeros((num_shapes, 2, 3), dtype=np.float32)
+    scene_min = np.full(3, np.inf)
+    scene_max = np.full(3, -np.inf)
+
+    for i, shape in enumerate(shapes):
+        mesh = wp.Mesh(
+            points=wp.array(shape.vertices, dtype=wp.vec3f),
+            indices=wp.array(shape.faces.flatten(), dtype=wp.int32),
+        )
+        warp_meshes.append(mesh)
+        mesh_bounds[i, 0] = shape.vertices.min(axis=0)
+        mesh_bounds[i, 1] = shape.vertices.max(axis=0)
+        scene_min = np.minimum(scene_min, mesh_bounds[i, 0])
+        scene_max = np.maximum(scene_max, mesh_bounds[i, 1])
+    
+    print(f"Scene bounds: [{scene_min[0]:.1f}, {scene_min[1]:.1f}, {scene_min[2]:.1f}] to "
+          f"[{scene_max[0]:.1f}, {scene_max[1]:.1f}, {scene_max[2]:.1f}]")
+
+    ctx = RenderContext(
+        width=config.width, height=config.height,
+        enable_textures=False, enable_shadows=True,
+        enable_ambient_lighting=True, enable_particles=False,
+        num_worlds=1, num_cameras=1,
+    )
+
+    ctx.num_shapes = num_shapes
+    ctx.mesh_ids = wp.array([m.id for m in warp_meshes], dtype=wp.uint64)
+    ctx.mesh_bounds = wp.array(mesh_bounds, dtype=wp.vec3f)
+    ctx.shape_types = wp.array([RenderShapeType.MESH] * num_shapes, dtype=wp.int32)
+    ctx.shape_enabled = wp.array(list(range(num_shapes)), dtype=wp.uint32)
+    ctx.shape_world_index = wp.array([0] * num_shapes, dtype=wp.int32)
+    ctx.shape_mesh_indices = wp.array(list(range(num_shapes)), dtype=wp.int32)
+    ctx.shape_materials = wp.array([-1] * num_shapes, dtype=wp.int32)
+
+    transforms = [wp.transformf(wp.vec3f(0, 0, 0), wp.quatf(0, 0, 0, 1))] * num_shapes
+    ctx.shape_transforms = wp.array(transforms, dtype=wp.transformf)
+    ctx.shape_sizes = wp.array([[1, 1, 1]] * num_shapes, dtype=wp.vec3f)
+
+    # Use colors from scene shapes
+    colors = np.array([s.color for s in shapes], dtype=np.float32)
+    ctx.shape_colors = wp.array(colors, dtype=wp.vec4f)
+
+    ctx.lights_active = wp.array([True], dtype=wp.bool)
+    ctx.lights_type = wp.array([1], dtype=wp.int32)
+    ctx.lights_cast_shadow = wp.array([True], dtype=wp.bool)
+    ctx.lights_position = wp.array([[0, 0, 0]], dtype=wp.vec3f)
+    ctx.lights_orientation = wp.array([[-0.577, 0.577, -0.577]], dtype=wp.vec3f)
+
+    return ctx, warp_meshes
+
+
+def render_to_pixels(ctx: RenderContext, camera: CameraData, config: RenderConfig) -> np.ndarray:
+    """
+    Render the scene from the given camera viewpoint.
+    
+    Returns:
+        RGB pixel array with shape (height, width, 3), dtype uint8.
+    """
+    camera_transforms, camera_rays = transforms_and_rays_from_camera_data(
+        camera, config.width, config.height
+    )
+
+    color_image = ctx.create_color_image_output()
+
+    ctx.render(
+        camera_transforms=camera_transforms,
+        camera_rays=camera_rays,
+        color_image=color_image,
+        refit_bvh=True,
+        clear_data=ClearData(clear_color=0xFF404040),
+    )
+
+    # Convert packed RGBA to RGB array
+    pixels = color_image.numpy()[0, 0].reshape(config.height, config.width)
+    r = (pixels >> 0) & 0xFF
+    g = (pixels >> 8) & 0xFF
+    b = (pixels >> 16) & 0xFF
+    rgb = np.stack([r, g, b], axis=-1).astype(np.uint8)
+
+    return rgb
+
+
+def save_pixels_to_png(pixels: np.ndarray, output_path: Path) -> None:
+    """Save RGB pixel array to PNG file."""
+    if not _PIL_AVAILABLE:
+        raise ImportError("PIL/Pillow is required for saving PNG files.")
+    img = Image.fromarray(pixels, mode="RGB")
+    img.save(output_path)
+    print(f"Saved: {output_path}")
+
+
+def render_and_save_frame(
+    ctx: RenderContext,
+    camera: CameraData,
+    config: RenderConfig,
+    frame_num: int,
+) -> np.ndarray:
+    """
+    Render a frame and save to disk.
+    
+    Convenience function that combines render_to_pixels and save_pixels_to_png.
+    
+    Returns:
+        RGB pixel array with shape (height, width, 3), dtype uint8.
+    """
+    print(f"Rendering frame {frame_num}...")
+    pixels = render_to_pixels(ctx, camera, config)
+    
+    output_path = config.get_output_path(frame_num)
+    save_pixels_to_png(pixels, output_path)
+    
+    return pixels
 
 
 # =============================================================================
