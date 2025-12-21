@@ -335,22 +335,38 @@ def depth_to_colormap(
     colormap_lut: wp.array(dtype=wp.uint32),
     out_rgba: wp.array(dtype=wp.uint32, ndim=3),
 ):
-    """Convert depth values to colormap visualization (closer = warm, far = cool for magma)."""
+    """
+    Convert depth values to colormap visualization with log transform.
+    
+    Uses log_100 transform: log(1 + depth * 99) / log(100)
+    This spreads near values more evenly across the colormap.
+    
+    Closer = warm (high LUT index), Far = cool (low LUT index).
+    Background uses the far end of the colormap.
+    """
     world_id, camera_id, pixel_id = wp.tid()
     depth = depth_image[world_id, camera_id, pixel_id]
     
+    lut_size = colormap_lut.shape[0]
+    
     if depth <= 0.0:
-        # No hit - dark gray background
-        out_rgba[world_id, camera_id, pixel_id] = wp.uint32(0xFF404040)
+        # No hit - use far end of colormap (index 0 after inversion)
+        out_rgba[world_id, camera_id, pixel_id] = colormap_lut[0]
         return
     
-    # Normalize depth to 0-1, invert so closer = higher value (brighter/warmer)
+    # Normalize depth to 0-1 (0=near, 1=far)
     denom = wp.max(max_depth - min_depth, 0.001)
     normalized = (depth - min_depth) / denom
-    inverted = 1.0 - normalized  # Invert: closer = 1, far = 0
     
-    # Map to colormap index (0-255)
-    lut_size = colormap_lut.shape[0]
+    # Apply log_100 transform: spreads near values more evenly
+    # log(1 + x * 99) / log(100) maps [0,1] -> [0,1] with log stretching
+    log_base = 100.0
+    transformed = wp.log(1.0 + normalized * (log_base - 1.0)) / wp.log(log_base)
+    
+    # Invert so closer = higher value (brighter/warmer in colormap)
+    inverted = 1.0 - transformed
+    
+    # Map to colormap index
     index = wp.int32(inverted * wp.float32(lut_size - 1))
     index = wp.clamp(index, 0, lut_size - 1)
     
