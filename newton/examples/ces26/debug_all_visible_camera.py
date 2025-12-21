@@ -21,6 +21,7 @@ PNG output ({base}_{AOV}.{frame:04d}.png):
 EXR output ({base}_{AOV}.{frame:04d}.exr):
 - debug_all_visible_color.2920.exr: Lit diffuse render (half-float RGB, [0, 1])
 - debug_all_visible_depth.2920.exr: Normalized depth (half-float Y, [0, 1], 0=near 1=far)
+- debug_all_visible_depth_heat.2920.exr: Depth heat map with interpolated colormap (half-float RGB)
 - debug_all_visible_normal.2920.exr: Surface normals (half-float RGB, [0, 1] mapped from [-1, 1])
 - debug_all_visible_object_id.2920.exr: Object ID colors (half-float RGB)
 - debug_all_visible_semantic.2920.exr: Semantic colors (half-float RGB)
@@ -55,7 +56,8 @@ from ces26_utils import (
 # Configuration
 # =============================================================================
 
-USD_FILE = r"C:\Users\chorvath\Downloads\20251220_iv060_flat_02\Collected_20251220_iv060_flat_02\20251220_iv060_flat_02.usd"
+#USD_FILE = r"C:\Users\chorvath\Downloads\20251220_iv060_flat_02\Collected_20251220_iv060_flat_02\20251220_iv060_flat_02.usd"
+USD_FILE = r"C:\Users\chorvath\Downloads\20251221_iv060_flat_03\20251221_iv060_flat_03\20251221_iv060_flat_03.usd"
 CAMERA_PATH = "/World/TD060"
 FRAMES = [2920, 3130]
 

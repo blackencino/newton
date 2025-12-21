@@ -104,6 +104,7 @@ class ExrOutputs:
     """
     color: np.ndarray       # Lit diffuse render, float32 RGB in [0, 1]
     depth: np.ndarray       # Normalized depth values, float32 in [0, 1] (0=near, 1=far)
+    depth_heat: np.ndarray  # Depth heat map visualization, float32 RGB in [0, 1]
     normal: np.ndarray      # Surface normals mapped to [0, 1], float32
     object_id: np.ndarray   # Object ID colors, float32 RGB in [0, 1]
     semantic: np.ndarray    # Semantic colors, float32 RGB in [0, 1]
@@ -394,6 +395,88 @@ def depth_to_colormap(
     index = wp.clamp(index, 0, lut_size - 1)
     
     out_rgba[world_id, camera_id, pixel_id] = colormap_lut[index]
+
+
+@wp.func
+def unpack_lut_to_rgb(packed: wp.uint32) -> wp.vec3f:
+    """Unpack uint32 RGBA to float RGB in [0, 1]."""
+    r = wp.float32((packed >> wp.uint32(0)) & wp.uint32(255)) / 255.0
+    g = wp.float32((packed >> wp.uint32(8)) & wp.uint32(255)) / 255.0
+    b = wp.float32((packed >> wp.uint32(16)) & wp.uint32(255)) / 255.0
+    return wp.vec3f(r, g, b)
+
+
+@wp.func
+def sample_colormap_interpolated(colormap_lut: wp.array(dtype=wp.uint32), t: wp.float32) -> wp.vec3f:
+    """
+    Sample colormap with linear interpolation for smooth gradients.
+    
+    Args:
+        colormap_lut: LUT with packed uint32 RGB values (256 entries)
+        t: Normalized position in [0, 1]
+        
+    Returns:
+        Interpolated RGB color in [0, 1]
+    """
+    lut_size = colormap_lut.shape[0]
+    
+    # Scale t to LUT range
+    pos = t * wp.float32(lut_size - 1)
+    
+    # Get integer indices and fractional part
+    idx0 = wp.int32(wp.floor(pos))
+    idx1 = idx0 + 1
+    frac = pos - wp.float32(idx0)
+    
+    # Clamp indices
+    idx0 = wp.clamp(idx0, 0, lut_size - 1)
+    idx1 = wp.clamp(idx1, 0, lut_size - 1)
+    
+    # Unpack and interpolate
+    c0 = unpack_lut_to_rgb(colormap_lut[idx0])
+    c1 = unpack_lut_to_rgb(colormap_lut[idx1])
+    
+    return c0 * (1.0 - frac) + c1 * frac
+
+
+@wp.kernel
+def depth_to_colormap_float(
+    depth_image: wp.array(dtype=wp.float32, ndim=3),
+    min_depth: wp.float32,
+    max_depth: wp.float32,
+    colormap_lut: wp.array(dtype=wp.uint32),
+    out_rgb: wp.array(dtype=wp.vec3f, ndim=3),
+):
+    """
+    Convert depth values to colormap visualization with interpolation.
+    
+    Uses log_250 transform and linear interpolation between LUT entries
+    for smooth gradients. Outputs float RGB in [0, 1].
+    
+    Closer = warm (high LUT index), Far = cool (low LUT index).
+    Background uses the far end of the colormap.
+    """
+    world_id, camera_id, pixel_id = wp.tid()
+    depth = depth_image[world_id, camera_id, pixel_id]
+    
+    if depth <= 0.0:
+        # No hit - use far end of colormap (index 0 after inversion)
+        out_rgb[world_id, camera_id, pixel_id] = unpack_lut_to_rgb(colormap_lut[0])
+        return
+    
+    # Normalize depth to 0-1 (0=near, 1=far)
+    denom = wp.max(max_depth - min_depth, 0.001)
+    normalized = (depth - min_depth) / denom
+    
+    # Apply log_250 transform: spreads near values more evenly
+    log_base = 250.0
+    transformed = wp.log(1.0 + normalized * (log_base - 1.0)) / wp.log(log_base)
+    
+    # Invert so closer = higher value (brighter/warmer in colormap)
+    t = 1.0 - transformed
+    
+    # Sample with interpolation
+    out_rgb[world_id, camera_id, pixel_id] = sample_colormap_interpolated(colormap_lut, t)
 
 
 # =============================================================================
@@ -1440,18 +1523,21 @@ def convert_aovs_to_exr_data(
     outputs: RenderOutputs,
     color_luts: ColorLUTs,
     config: RenderConfig,
+    depth_colormap: str = DepthColormap.MAGMA,
 ) -> ExrOutputs:
     """
     Convert raw GPU render outputs to float32 arrays for OpenEXR saving.
     
     Values are normalized/mapped to [0, 1]:
     - Depth is normalized to [0, 1] (0=near, 1=far, background=1)
+    - Depth heat uses interpolated colormap sampling for smooth gradients
     - Normals are mapped from [-1, 1] to [0, 1]
     
     Args:
         outputs: Raw RenderOutputs from render_all_aovs
         color_luts: ColorLUTs for object_id and semantic mapping
         config: Render configuration (for dimensions)
+        depth_colormap: Colormap for depth_heat (DepthColormap.VIRIDIS or .MAGMA)
         
     Returns:
         ExrOutputs with all passes as float32 arrays in [0, 1]
@@ -1463,18 +1549,35 @@ def convert_aovs_to_exr_data(
         outputs.color_image.numpy()[0, 0], height, width
     )
     
+    # Compute depth range once (used by both depth passes)
+    depth_range = wp.array([1e10, 0.0], dtype=wp.float32)
+    wp.launch(
+        find_depth_range,
+        outputs.depth_image.shape,
+        [outputs.depth_image, depth_range],
+    )
+    depth_range_np = depth_range.numpy()
+    min_depth, max_depth = depth_range_np[0], depth_range_np[1]
+    
     # Depth pass - normalize to 0-1
     depth_raw = outputs.depth_image.numpy()[0, 0].reshape(height, width)
-    # Find valid depth range (exclude background = 0 or negative)
     valid_mask = depth_raw > 0
     if valid_mask.any():
-        min_depth = depth_raw[valid_mask].min()
-        max_depth = depth_raw[valid_mask].max()
         denom = max(max_depth - min_depth, 0.001)
         # Normalize: 0=near, 1=far
         depth = np.where(valid_mask, (depth_raw - min_depth) / denom, 1.0)
     else:
         depth = np.ones_like(depth_raw)
+    
+    # Depth heat pass - interpolated colormap for smooth gradients
+    colormap_lut = get_colormap_lut(depth_colormap)
+    depth_heat_rgb = wp.zeros((1, 1, width * height), dtype=wp.vec3f)
+    wp.launch(
+        depth_to_colormap_float,
+        outputs.depth_image.shape,
+        [outputs.depth_image, min_depth, max_depth, colormap_lut, depth_heat_rgb],
+    )
+    depth_heat = depth_heat_rgb.numpy()[0, 0].reshape(height, width, 3)
     
     # Normal pass - map from [-1, 1] to [0, 1]
     normal_raw = outputs.normal_image.numpy()[0, 0].reshape(height, width, 3)
@@ -1505,6 +1608,7 @@ def convert_aovs_to_exr_data(
     return ExrOutputs(
         color=color_rgb.astype(np.float32),
         depth=depth.astype(np.float32),
+        depth_heat=depth_heat.astype(np.float32),
         normal=normal.astype(np.float32),
         object_id=object_id_rgb.astype(np.float32),
         semantic=semantic_rgb.astype(np.float32),
@@ -1581,7 +1685,8 @@ def save_all_aovs_exr(
     Creates files named {base}_{AOV}.{frame:04d}.exr:
     - {base}_color.0001.exr: RGB color (half-float)
     - {base}_depth.0001.exr: Single-channel depth (half-float)
-    - {base}_normal.0001.exr: RGB normals (half-float, values in [-1, 1])
+    - {base}_depth_heat.0001.exr: Depth heat map with interpolated colormap (half-float RGB)
+    - {base}_normal.0001.exr: RGB normals (half-float, values in [0, 1])
     - {base}_object_id.0001.exr: RGB object ID colors (half-float)
     - {base}_semantic.0001.exr: RGB semantic colors (half-float)
     
@@ -1598,6 +1703,7 @@ def save_all_aovs_exr(
     
     save_exr_rgb(exr_outputs.color, aov_path("color"))
     save_exr_depth(exr_outputs.depth, aov_path("depth"))
+    save_exr_rgb(exr_outputs.depth_heat, aov_path("depth_heat"))
     save_exr_rgb(exr_outputs.normal, aov_path("normal"))
     save_exr_rgb(exr_outputs.object_id, aov_path("object_id"))
     save_exr_rgb(exr_outputs.semantic, aov_path("semantic"))
@@ -1627,7 +1733,7 @@ def render_and_save_all_aovs(
         frame_num: Frame number for filename (formatted as 4-digit zero-padded)
         base_name: Base filename (before the AOV suffix)
         output_format: Output format - "png" for uint8 PNG or "exr" for half-float OpenEXR
-        depth_colormap: Colormap for depth_heat (DepthColormap.VIRIDIS or .MAGMA, PNG only)
+        depth_colormap: Colormap for depth_heat (DepthColormap.VIRIDIS or .MAGMA)
         
     Returns:
         PixelOutputs (for PNG) or ExrOutputs (for EXR) with all passes as numpy arrays
@@ -1638,8 +1744,8 @@ def render_and_save_all_aovs(
     outputs = render_all_aovs(ctx, camera, config)
     
     if output_format.lower() == "exr":
-        # Convert to float data and save as EXR
-        exr_outputs = convert_aovs_to_exr_data(outputs, color_luts, config)
+        # Convert to float data (with interpolated depth_heat) and save as EXR
+        exr_outputs = convert_aovs_to_exr_data(outputs, color_luts, config, depth_colormap)
         save_all_aovs_exr(exr_outputs, config.output_dir, frame_num, base_name)
         return exr_outputs
     else:

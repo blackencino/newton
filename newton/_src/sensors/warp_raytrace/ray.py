@@ -590,7 +590,11 @@ def ray_mesh_with_bvh(
 ) -> tuple[wp.bool, wp.float32, wp.vec3f, wp.float32, wp.float32, wp.int32, wp.int32]:
     """Returns intersection information at which a ray intersects with a mesh.
 
-    Requires wp.Mesh be constructed and their ids to be passed"""
+    Requires wp.Mesh be constructed and their ids to be passed.
+    
+    Note: This function renders both front and back faces (double-sided).
+    For backface hits, the normal is flipped to face the ray direction.
+    """
 
     ray_origin_local, ray_direction_local = map_ray_to_local(transform, ray_origin_world, ray_direction_world)
 
@@ -600,9 +604,15 @@ def ray_mesh_with_bvh(
 
     query = wp.mesh_query_ray(mesh_bvh_ids[mesh_shape_id], ray_origin_local, ray_direction_local, max_t)
 
-    if query.result and wp.dot(ray_direction_local, query.normal) < 0.0:  # Backface culling in local space
+    if query.result:
+        # Transform normal to world space
         normal = wp.transform_vector(transform, wp.cw_mul(size, query.normal))
         normal = wp.normalize(normal)
+        
+        # Flip normal for backface hits so it faces the camera
+        if wp.dot(ray_direction_world, normal) > 0.0:
+            normal = -normal
+        
         return True, query.t, normal, query.u, query.v, query.face, mesh_shape_id
 
     return False, wp.inf, wp.vec3f(0.0, 0.0, 0.0), 0.0, 0.0, -1, -1
