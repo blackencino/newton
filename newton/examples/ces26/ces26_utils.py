@@ -21,7 +21,10 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 import numpy as np
+import warp as wp
 from pxr import Gf, Usd, UsdGeom, UsdShade
+
+from newton._src.sensors.warp_raytrace import ClearData, RenderContext, RenderShapeType
 
 # Optional PIL import for texture loading
 try:
@@ -68,6 +71,17 @@ class MeshLoadOptions:
             )
 
 
+@dataclass
+class CameraData:
+    """Container for extracted USD camera data."""
+    position: np.ndarray      # World-space position (3,)
+    right: np.ndarray         # Camera +X axis in world space (normalized)
+    up: np.ndarray            # Camera +Y axis in world space (normalized)
+    forward: np.ndarray       # Camera view direction (-Z in local) in world space (normalized)
+    fov_vertical: float       # Vertical field of view in radians
+    fov_horizontal: float     # Horizontal field of view in radians
+
+
 # =============================================================================
 # Geometry Utilities
 # =============================================================================
@@ -112,6 +126,159 @@ def transform_points_to_world(
     pts_h = np.concatenate([pts, np.ones((pts.shape[0], 1), dtype=np.float64)], axis=1)
     pts_world_h = pts_h @ M  # Row-vectors * matrix
     return pts_world_h[:, :3]
+
+
+# =============================================================================
+# Camera Utilities
+# =============================================================================
+
+def get_camera_from_stage(
+    stage: Usd.Stage,
+    camera_path: str,
+    time_code: Usd.TimeCode,
+    verbose: bool = False
+) -> CameraData:
+    """
+    Extract camera world-space basis and FOV from a USD camera prim.
+    
+    USD/RenderMan camera coordinate system:
+    - X: right
+    - Y: up
+    - Z: toward the sensor ("into the lens")
+    
+    The view direction is -Z (same as OpenGL convention).
+    
+    Args:
+        stage: USD stage
+        camera_path: Path to camera prim (e.g., "/World/Camera")
+        time_code: Time code for sampling animated cameras
+        verbose: If True, print camera info
+        
+    Returns:
+        CameraData with position and orientation in world space
+        
+    Raises:
+        RuntimeError: If camera prim not found or invalid
+    """
+    import math
+    
+    camera_prim = stage.GetPrimAtPath(camera_path)
+    if not camera_prim or not camera_prim.IsA(UsdGeom.Camera):
+        raise RuntimeError(f"Camera not found at {camera_path}")
+
+    usd_camera = UsdGeom.Camera(camera_prim)
+    
+    # Get intrinsics from Gf.Camera
+    gf_camera = usd_camera.GetCamera(time_code)
+    fov_v = gf_camera.GetFieldOfView(Gf.Camera.FOVVertical)
+    fov_h = gf_camera.GetFieldOfView(Gf.Camera.FOVHorizontal)
+
+    # Get extrinsics using XformCache (same approach as mesh loading)
+    xcache = UsdGeom.XformCache(time_code)
+    world_mat = xcache.GetLocalToWorldTransform(camera_prim)
+
+    # Transform basis points to world space
+    pts_camera = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float64)
+    pts_world = transform_points_to_world(pts_camera, world_mat)
+
+    cam_origin, x_pt, y_pt, z_pt = pts_world
+
+    # Extract and normalize basis vectors
+    right = x_pt - cam_origin
+    up = y_pt - cam_origin
+    z_axis = z_pt - cam_origin  # +Z points toward sensor
+    
+    right = right / np.linalg.norm(right)
+    up = up / np.linalg.norm(up)
+    forward = -z_axis / np.linalg.norm(z_axis)  # View direction is -Z
+
+    if verbose:
+        print(f"Camera at frame {time_code}: FOV={fov_v:.2f}°")
+        print(f"  Position: [{cam_origin[0]:.3f}, {cam_origin[1]:.3f}, {cam_origin[2]:.3f}]")
+        print(f"  Forward:  [{forward[0]:.3f}, {forward[1]:.3f}, {forward[2]:.3f}]")
+
+    return CameraData(
+        position=cam_origin.astype(np.float32),
+        right=right.astype(np.float32),
+        up=up.astype(np.float32),
+        forward=forward.astype(np.float32),
+        fov_vertical=math.radians(fov_v),
+        fov_horizontal=math.radians(fov_h),
+    )
+
+
+def camera_rotation_matrix(camera: CameraData) -> np.ndarray:
+    """
+    Build a 3x3 rotation matrix from camera basis vectors.
+    
+    Columns are [right, up, forward].
+    
+    Args:
+        camera: CameraData with basis vectors
+        
+    Returns:
+        3x3 orthonormal rotation matrix
+    """
+    return np.column_stack([camera.right, camera.up, camera.forward]).astype(np.float32)
+
+
+# =============================================================================
+# Warp Kernel
+# =============================================================================
+
+@wp.kernel
+def generate_world_rays_kernel(
+    width: int,
+    height: int,
+    fov_y: float,
+    cam_pos: wp.vec3f,
+    cam_right: wp.vec3f,
+    cam_up: wp.vec3f,
+    cam_forward: wp.vec3f,
+    out_rays: wp.array(dtype=wp.vec3, ndim=4),
+):
+    """Generate rays directly in world space using camera basis vectors."""
+    x, y = wp.tid()
+    
+    if x >= width or y >= height:
+        return
+
+    aspect_ratio = float(width) / float(height)
+    u = (float(x) + 0.5) / float(width) - 0.5
+    v = (float(y) + 0.5) / float(height) - 0.5
+    h = wp.tan(fov_y / 2.0)
+    
+    # Local ray direction (camera looks down -Z)
+    x_local = u * 2.0 * h * aspect_ratio
+    y_local = -v * 2.0 * h
+    
+    # Transform to world space
+    ray_dir_world = x_local * cam_right + y_local * cam_up + (-1.0) * (-cam_forward)
+    
+    out_rays[0, y, x, 0] = cam_pos
+    out_rays[0, y, x, 1] = wp.normalize(ray_dir_world)
+
+
+def transforms_and_rays_from_camera_data(camera: CameraData, width: int, height: int) -> tuple[wp.array(dtype=wp.transformf), wp.array(dtype=wp.vec3f)]:
+    cam_pos = wp.vec3f(*camera.position)
+    cam_right = wp.vec3f(*camera.right)
+    cam_up = wp.vec3f(*camera.up)
+    cam_forward = wp.vec3f(*camera.forward)
+    
+    camera_rays = wp.zeros((1, height, width, 2), dtype=wp.vec3f)
+    
+    wp.launch(
+        kernel=generate_world_rays_kernel,
+        dim=(width, height),
+        inputs=[width, height, camera.fov_vertical, cam_pos, cam_right, cam_up, cam_forward, camera_rays]
+    )
+
+    identity_transform = wp.transformf(wp.vec3f(0, 0, 0), wp.quatf(0, 0, 0, 1))
+    camera_transforms = wp.array([[identity_transform]], dtype=wp.transformf)
+
+    return camera_transforms, camera_rays
+
+
 
 
 # =============================================================================
