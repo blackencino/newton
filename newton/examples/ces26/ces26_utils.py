@@ -18,7 +18,6 @@ import hashlib
 import os
 import re
 from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
 from typing import Callable, Protocol
 
@@ -34,6 +33,146 @@ try:
     _PIL_AVAILABLE = True
 except ImportError:
     _PIL_AVAILABLE = False
+
+
+# =============================================================================
+# Multi-AOV Render Outputs
+# =============================================================================
+
+@dataclass
+class RenderOutputs:
+    """
+    Container for all raw GPU render outputs from a single render pass.
+    
+    The raytracer outputs multiple AOVs (Arbitrary Output Variables) in one pass:
+    - color_image: Lit diffuse render (packed RGBA as uint32)
+    - depth_image: Ray hit distance (float32)
+    - shape_index_image: Shape index at each pixel (uint32)
+    - normal_image: Surface normal at hit point (vec3f)
+    
+    The shape_index_image is key for generating additional passes like object_id
+    and semantic - we use lookup tables to map shape indices to colors in post.
+    """
+    color_image: wp.array  # (num_worlds, num_cameras, width*height), uint32
+    depth_image: wp.array  # (num_worlds, num_cameras, width*height), float32
+    shape_index_image: wp.array  # (num_worlds, num_cameras, width*height), uint32
+    normal_image: wp.array  # (num_worlds, num_cameras, width*height), vec3f
+
+
+@dataclass
+class ColorLUTs:
+    """
+    Lookup tables for mapping shape indices to different color channels.
+    
+    Each LUT is a warp array of packed uint32 RGBA colors, indexed by shape index.
+    Used to post-process shape_index_image into different color passes.
+    """
+    object_id: wp.array  # (num_shapes,), uint32 packed RGBA
+    semantic: wp.array   # (num_shapes,), uint32 packed RGBA
+
+
+@dataclass
+class PixelOutputs:
+    """
+    Container for converted numpy RGB arrays, ready for saving to disk.
+    
+    All arrays are (height, width, 3) uint8 RGB format.
+    """
+    color: np.ndarray      # Lit diffuse render
+    depth: np.ndarray      # Depth visualization (grayscale as RGB)
+    normal: np.ndarray     # Normal visualization ((n+1)/2 mapped to 0-255)
+    object_id: np.ndarray  # Object ID colors
+    semantic: np.ndarray   # Semantic colors
+
+
+# =============================================================================
+# Warp Kernels for Shape Index → Color Mapping
+# =============================================================================
+
+@wp.kernel
+def shape_index_to_color_lut(
+    shape_indices: wp.array(dtype=wp.uint32, ndim=3),
+    color_lut: wp.array(dtype=wp.uint32),
+    out_rgba: wp.array(dtype=wp.uint32, ndim=3),
+):
+    """Map shape indices to colors using a lookup table."""
+    world_id, camera_id, pixel_id = wp.tid()
+    shape_index = shape_indices[world_id, camera_id, pixel_id]
+    if shape_index < wp.uint32(color_lut.shape[0]):
+        out_rgba[world_id, camera_id, pixel_id] = color_lut[wp.int32(shape_index)]
+    else:
+        # Background or invalid - transparent black
+        out_rgba[world_id, camera_id, pixel_id] = wp.uint32(0xFF404040)
+
+
+@wp.kernel
+def depth_to_grayscale(
+    depth_image: wp.array(dtype=wp.float32, ndim=3),
+    min_depth: wp.float32,
+    max_depth: wp.float32,
+    out_rgba: wp.array(dtype=wp.uint32, ndim=3),
+):
+    """Convert depth values to grayscale visualization (closer = brighter)."""
+    world_id, camera_id, pixel_id = wp.tid()
+    depth = depth_image[world_id, camera_id, pixel_id]
+    
+    if depth <= 0.0:
+        # No hit - dark gray background
+        out_rgba[world_id, camera_id, pixel_id] = wp.uint32(0xFF404040)
+        return
+    
+    # Normalize and invert (closer = brighter)
+    denom = wp.max(max_depth - min_depth, 0.001)
+    normalized = (depth - min_depth) / denom
+    value = wp.uint32((1.0 - normalized) * 255.0)
+    value = wp.min(value, wp.uint32(255))
+    
+    # Pack as grayscale RGBA
+    out_rgba[world_id, camera_id, pixel_id] = (
+        wp.uint32(0xFF000000) | (value << wp.uint32(16)) | (value << wp.uint32(8)) | value
+    )
+
+
+@wp.kernel
+def normal_to_rgb(
+    normal_image: wp.array(dtype=wp.vec3f, ndim=3),
+    out_rgba: wp.array(dtype=wp.uint32, ndim=3),
+):
+    """Convert world-space normals to RGB visualization."""
+    world_id, camera_id, pixel_id = wp.tid()
+    normal = normal_image[world_id, camera_id, pixel_id]
+    
+    # Check for zero normal (no hit)
+    length = wp.length(normal)
+    if length < 0.001:
+        out_rgba[world_id, camera_id, pixel_id] = wp.uint32(0xFF404040)
+        return
+    
+    # Map from [-1,1] to [0,1] then to [0,255]
+    r = wp.uint32((normal[0] * 0.5 + 0.5) * 255.0)
+    g = wp.uint32((normal[1] * 0.5 + 0.5) * 255.0)
+    b = wp.uint32((normal[2] * 0.5 + 0.5) * 255.0)
+    
+    r = wp.min(wp.max(r, wp.uint32(0)), wp.uint32(255))
+    g = wp.min(wp.max(g, wp.uint32(0)), wp.uint32(255))
+    b = wp.min(wp.max(b, wp.uint32(0)), wp.uint32(255))
+    
+    out_rgba[world_id, camera_id, pixel_id] = (
+        wp.uint32(0xFF000000) | (b << wp.uint32(16)) | (g << wp.uint32(8)) | r
+    )
+
+
+@wp.kernel
+def find_depth_range(
+    depth_image: wp.array(dtype=wp.float32, ndim=3),
+    depth_range: wp.array(dtype=wp.float32),
+):
+    """Find min/max depth values for normalization."""
+    world_id, camera_id, pixel_id = wp.tid()
+    depth = depth_image[world_id, camera_id, pixel_id]
+    if depth > 0.0:
+        wp.atomic_min(depth_range, 0, depth)
+        wp.atomic_max(depth_range, 1, depth)
 
 
 # =============================================================================
@@ -64,13 +203,6 @@ class ColorExtractor(Protocol):
 # Diegetic: The Core Scene Element
 # =============================================================================
 
-class ColorChannel(Enum):
-    """Selects which color channel to use for rendering."""
-    DIFFUSE_ALBEDO = "diffuse_albedo"
-    OBJECT_ID = "object_id"
-    SEMANTIC = "semantic"
-
-
 @dataclass(frozen=True)
 class Diegetic:
     """
@@ -79,23 +211,25 @@ class Diegetic:
     "Diegetic" (from film theory): existing within the world of the narrative.
     Each Diegetic represents a visible piece of the scene with pre-computed colors
     for different rendering purposes.
+
+    In film theory, diegesis refers to the world of the story. A "diegetic" object 
+    is anything that exists within the characters' reality (a chair, a gun, an actor, a car).
+
+    It specifically excludes "non-diegetic" elements like boom mics, C-stands, film lights, 
+    and the camera itself, because the characters do not "see" those things.
+    
+    Color channels are stored as raw data for use by different render passes:
+    - diffuse_albedo: Used by the lit color render pass
+    - object_id: Used to create object ID lookup table for post-processing
+    - semantic: Used to create semantic lookup table for post-processing
     """
     name: str
     path: str
     vertices: np.ndarray  # World-space positions (N, 3), float32
     faces: np.ndarray     # Triangle indices (M, 3), int32
-    diffuse_albedo: RGB   # For photorealistic rendering
-    object_id: RGB        # For instance segmentation
-    semantic: RGB         # For semantic segmentation
-    
-    def get_color(self, channel: ColorChannel) -> RGB:
-        """Return the color for the specified channel."""
-        if channel == ColorChannel.DIFFUSE_ALBEDO:
-            return self.diffuse_albedo
-        elif channel == ColorChannel.OBJECT_ID:
-            return self.object_id
-        else:
-            return self.semantic
+    diffuse_albedo: RGB   # For photorealistic rendering (used in lit pass)
+    object_id: RGB        # For instance segmentation (post-process LUT)
+    semantic: RGB         # For semantic segmentation (post-process LUT)
 
 
 @dataclass(frozen=True)
@@ -762,26 +896,41 @@ def transforms_and_rays_from_camera_data(camera: CameraData, width: int, height:
 # Rendering (Diegetic -> Pixels)
 # =============================================================================
 
+def rgb_to_packed_uint32(r: float, g: float, b: float, a: float = 1.0) -> int:
+    """Convert RGB floats (0-1) to packed RGBA uint32."""
+    return (
+        (int(a * 255) << 24) |
+        (int(b * 255) << 16) |
+        (int(g * 255) << 8) |
+        int(r * 255)
+    )
+
+
 def setup_render_context(
     diegetics: list[Diegetic],
     config: RenderConfig,
-    channel: ColorChannel = ColorChannel.DIFFUSE_ALBEDO,
-) -> tuple[RenderContext, list]:
+) -> tuple[RenderContext, ColorLUTs, list]:
     """
-    Create RenderContext from Diegetics using the specified color channel.
+    Create RenderContext and ColorLUTs from Diegetics for multi-AOV rendering.
     
-    This is the preferred rendering entry point for the new functional pipeline.
+    This sets up the scene for a single render pass that outputs multiple AOVs:
+    - Lit color render (uses diffuse_albedo)
+    - Depth
+    - Surface normals
+    - Shape indices (for post-processing to object_id and semantic passes)
+    
+    The ColorLUTs can be used to convert shape_index output to object_id or
+    semantic color passes in post-processing.
     
     Args:
         diegetics: List of Diegetic scene elements
         config: Render configuration (resolution, output path)
-        channel: Which color channel to use for rendering
         
     Returns:
-        Tuple of (RenderContext, list of warp.Mesh objects)
+        Tuple of (RenderContext, ColorLUTs, list of warp.Mesh objects)
     """
     num_shapes = len(diegetics)
-    print(f"Setting up render context with {num_shapes} diegetics (channel: {channel.value})...")
+    print(f"Setting up render context with {num_shapes} diegetics for multi-AOV rendering...")
 
     warp_meshes = []
     mesh_bounds = np.zeros((num_shapes, 2, 3), dtype=np.float32)
@@ -822,11 +971,11 @@ def setup_render_context(
     ctx.shape_transforms = wp.array(transforms, dtype=wp.transformf)
     ctx.shape_sizes = wp.array([[1, 1, 1]] * num_shapes, dtype=wp.vec3f)
 
-    # Extract colors from diegetics using specified channel
-    colors = np.array([
-        (*d.get_color(channel), 1.0) for d in diegetics
+    # Use diffuse_albedo for the lit color render pass
+    diffuse_colors = np.array([
+        (*d.diffuse_albedo, 1.0) for d in diegetics
     ], dtype=np.float32)
-    ctx.shape_colors = wp.array(colors, dtype=wp.vec4f)
+    ctx.shape_colors = wp.array(diffuse_colors, dtype=wp.vec4f)
 
     ctx.lights_active = wp.array([True], dtype=wp.bool)
     ctx.lights_type = wp.array([1], dtype=wp.int32)
@@ -834,38 +983,162 @@ def setup_render_context(
     ctx.lights_position = wp.array([[0, 0, 0]], dtype=wp.vec3f)
     ctx.lights_orientation = wp.array([[-0.577, 0.577, -0.577]], dtype=wp.vec3f)
 
-    return ctx, warp_meshes
-
-
-def render_to_pixels(ctx: RenderContext, camera: CameraData, config: RenderConfig) -> np.ndarray:
-    """
-    Render the scene from the given camera viewpoint.
+    # Build ColorLUTs for post-processing shape_index to object_id and semantic
+    object_id_lut = np.array([
+        rgb_to_packed_uint32(*d.object_id) for d in diegetics
+    ], dtype=np.uint32)
+    semantic_lut = np.array([
+        rgb_to_packed_uint32(*d.semantic) for d in diegetics
+    ], dtype=np.uint32)
     
+    color_luts = ColorLUTs(
+        object_id=wp.array(object_id_lut, dtype=wp.uint32),
+        semantic=wp.array(semantic_lut, dtype=wp.uint32),
+    )
+
+    return ctx, color_luts, warp_meshes
+
+
+def render_all_aovs(
+    ctx: RenderContext,
+    camera: CameraData,
+    config: RenderConfig,
+) -> RenderOutputs:
+    """
+    Render the scene from the given camera viewpoint, outputting all AOVs.
+    
+    This performs a single render pass that outputs:
+    - color_image: Lit diffuse render (packed RGBA uint32)
+    - depth_image: Ray hit distance (float32)
+    - shape_index_image: Shape index at each pixel (uint32)
+    - normal_image: Surface normal at hit point (vec3f)
+    
+    The shape_index_image can be post-processed with ColorLUTs to create
+    additional passes like object_id and semantic.
+    
+    Args:
+        ctx: RenderContext configured with scene geometry
+        camera: Camera position and orientation
+        config: Render configuration (resolution)
+        
     Returns:
-        RGB pixel array with shape (height, width, 3), dtype uint8.
+        RenderOutputs containing all raw GPU output arrays
     """
     camera_transforms, camera_rays = transforms_and_rays_from_camera_data(
         camera, config.width, config.height
     )
 
+    # Create all output arrays
     color_image = ctx.create_color_image_output()
+    depth_image = ctx.create_depth_image_output()
+    shape_index_image = ctx.create_shape_index_image_output()
+    normal_image = ctx.create_normal_image_output()
 
+    # Single render pass outputs all AOVs
     ctx.render(
         camera_transforms=camera_transforms,
         camera_rays=camera_rays,
         color_image=color_image,
+        depth_image=depth_image,
+        shape_index_image=shape_index_image,
+        normal_image=normal_image,
         refit_bvh=True,
         clear_data=ClearData(clear_color=0xFF404040),
     )
 
-    # Convert packed RGBA to RGB array
-    pixels = color_image.numpy()[0, 0].reshape(config.height, config.width)
+    return RenderOutputs(
+        color_image=color_image,
+        depth_image=depth_image,
+        shape_index_image=shape_index_image,
+        normal_image=normal_image,
+    )
+
+
+def packed_uint32_to_rgb(packed: np.ndarray, height: int, width: int) -> np.ndarray:
+    """Convert packed RGBA uint32 array to RGB uint8 array."""
+    pixels = packed.reshape(height, width)
     r = (pixels >> 0) & 0xFF
     g = (pixels >> 8) & 0xFF
     b = (pixels >> 16) & 0xFF
-    rgb = np.stack([r, g, b], axis=-1).astype(np.uint8)
+    return np.stack([r, g, b], axis=-1).astype(np.uint8)
 
-    return rgb
+
+def convert_aovs_to_pixels(
+    outputs: RenderOutputs,
+    color_luts: ColorLUTs,
+    config: RenderConfig,
+) -> PixelOutputs:
+    """
+    Convert raw GPU render outputs to numpy RGB arrays for saving.
+    
+    Applies ColorLUTs to shape_index_image to create object_id and semantic passes.
+    
+    Args:
+        outputs: Raw RenderOutputs from render_all_aovs
+        color_luts: ColorLUTs for object_id and semantic mapping
+        config: Render configuration (for dimensions)
+        
+    Returns:
+        PixelOutputs with all passes as (height, width, 3) uint8 arrays
+    """
+    height, width = config.height, config.width
+    
+    # Color pass - direct conversion
+    color_rgb = packed_uint32_to_rgb(
+        outputs.color_image.numpy()[0, 0], height, width
+    )
+    
+    # Depth pass - normalize and convert to grayscale
+    depth_range = wp.array([1e10, 0.0], dtype=wp.float32)
+    wp.launch(
+        find_depth_range,
+        outputs.depth_image.shape,
+        [outputs.depth_image, depth_range],
+    )
+    depth_range_np = depth_range.numpy()
+    
+    depth_rgba = wp.zeros_like(outputs.color_image)
+    wp.launch(
+        depth_to_grayscale,
+        outputs.depth_image.shape,
+        [outputs.depth_image, depth_range_np[0], depth_range_np[1], depth_rgba],
+    )
+    depth_rgb = packed_uint32_to_rgb(depth_rgba.numpy()[0, 0], height, width)
+    
+    # Normal pass - convert normals to RGB
+    normal_rgba = wp.zeros_like(outputs.color_image)
+    wp.launch(
+        normal_to_rgb,
+        outputs.normal_image.shape,
+        [outputs.normal_image, normal_rgba],
+    )
+    normal_rgb = packed_uint32_to_rgb(normal_rgba.numpy()[0, 0], height, width)
+    
+    # Object ID pass - use LUT on shape indices
+    object_id_rgba = wp.zeros_like(outputs.color_image)
+    wp.launch(
+        shape_index_to_color_lut,
+        outputs.shape_index_image.shape,
+        [outputs.shape_index_image, color_luts.object_id, object_id_rgba],
+    )
+    object_id_rgb = packed_uint32_to_rgb(object_id_rgba.numpy()[0, 0], height, width)
+    
+    # Semantic pass - use LUT on shape indices
+    semantic_rgba = wp.zeros_like(outputs.color_image)
+    wp.launch(
+        shape_index_to_color_lut,
+        outputs.shape_index_image.shape,
+        [outputs.shape_index_image, color_luts.semantic, semantic_rgba],
+    )
+    semantic_rgb = packed_uint32_to_rgb(semantic_rgba.numpy()[0, 0], height, width)
+    
+    return PixelOutputs(
+        color=color_rgb,
+        depth=depth_rgb,
+        normal=normal_rgb,
+        object_id=object_id_rgb,
+        semantic=semantic_rgb,
+    )
 
 
 def save_pixels_to_png(pixels: np.ndarray, output_path: Path) -> None:
@@ -877,27 +1150,81 @@ def save_pixels_to_png(pixels: np.ndarray, output_path: Path) -> None:
     print(f"Saved: {output_path}")
 
 
-def render_and_save_frame(
+def save_all_aovs(
+    pixel_outputs: PixelOutputs,
+    output_dir: Path,
+    frame_num: int,
+    base_name: str = "render",
+    ext: str = "png",
+) -> None:
+    """
+    Save all AOV passes to disk as image files.
+    
+    Creates files named {base}_{AOV}.{frame:04d}.{ext}:
+    - {base}_color.0001.png
+    - {base}_depth.0001.png
+    - {base}_normal.0001.png
+    - {base}_object_id.0001.png
+    - {base}_semantic.0001.png
+    
+    Args:
+        pixel_outputs: PixelOutputs from convert_aovs_to_pixels
+        output_dir: Directory to save files
+        frame_num: Frame number for filename (formatted as 4-digit zero-padded)
+        base_name: Base filename (before the AOV suffix)
+        ext: File extension (default: "png")
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    def aov_path(aov: str) -> Path:
+        return output_dir / f"{base_name}_{aov}.{frame_num:04d}.{ext}"
+    
+    save_pixels_to_png(pixel_outputs.color, aov_path("color"))
+    save_pixels_to_png(pixel_outputs.depth, aov_path("depth"))
+    save_pixels_to_png(pixel_outputs.normal, aov_path("normal"))
+    save_pixels_to_png(pixel_outputs.object_id, aov_path("object_id"))
+    save_pixels_to_png(pixel_outputs.semantic, aov_path("semantic"))
+
+
+def render_and_save_all_aovs(
     ctx: RenderContext,
+    color_luts: ColorLUTs,
     camera: CameraData,
     config: RenderConfig,
     frame_num: int,
-) -> np.ndarray:
+    base_name: str = "render",
+    ext: str = "png",
+) -> PixelOutputs:
     """
-    Render a frame and save to disk.
+    Render all AOVs and save them to disk.
     
-    Convenience function that combines render_to_pixels and save_pixels_to_png.
+    Convenience function that combines render_all_aovs, convert_aovs_to_pixels,
+    and save_all_aovs.
     
+    Args:
+        ctx: RenderContext configured with scene geometry
+        color_luts: ColorLUTs for post-processing
+        camera: Camera position and orientation
+        config: Render configuration (resolution, output dir)
+        frame_num: Frame number for filename (formatted as 4-digit zero-padded)
+        base_name: Base filename (before the AOV suffix)
+        ext: File extension (default: "png")
+        
     Returns:
-        RGB pixel array with shape (height, width, 3), dtype uint8.
+        PixelOutputs with all passes as numpy arrays
     """
-    print(f"Rendering frame {frame_num}...")
-    pixels = render_to_pixels(ctx, camera, config)
+    print(f"Rendering frame {frame_num} (all AOVs)...")
     
-    output_path = config.get_output_path(frame_num)
-    save_pixels_to_png(pixels, output_path)
+    # Single render pass
+    outputs = render_all_aovs(ctx, camera, config)
     
-    return pixels
+    # Convert to pixels
+    pixel_outputs = convert_aovs_to_pixels(outputs, color_luts, config)
+    
+    # Save all passes
+    save_all_aovs(pixel_outputs, config.output_dir, frame_num, base_name, ext)
+    
+    return pixel_outputs
 
 
 # =============================================================================
@@ -1120,7 +1447,7 @@ def setup_polyscope(up_direction: str = "z_up") -> None:
 
 def register_diegetics_with_polyscope(
     diegetics: list[Diegetic],
-    channel: ColorChannel = ColorChannel.DIFFUSE_ALBEDO,
+    use_diffuse: bool = True,
     verbose: bool = False,
 ) -> None:
     """
@@ -1128,14 +1455,14 @@ def register_diegetics_with_polyscope(
     
     Args:
         diegetics: List of Diegetic scene elements
-        channel: Which color channel to use for visualization
+        use_diffuse: If True, use diffuse_albedo colors; otherwise use object_id
         verbose: If True, print registration info
     """
     import polyscope as ps
     
     for d in diegetics:
         pm = ps.register_surface_mesh(d.name, d.vertices, d.faces)
-        color = d.get_color(channel)
+        color = d.diffuse_albedo if use_diffuse else d.object_id
         pm.set_color(color)
         
         if verbose:

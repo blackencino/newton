@@ -3,12 +3,19 @@
 """
 Render all visible meshes in USD scene using the TD060 camera.
 
-Uses the Diegetic functional pipeline from ces26_utils:
+Uses the Diegetic functional pipeline from ces26_utils with multi-AOV output:
 1. parse_diegetics: Folds geometry + color extractors over USD stage
-2. setup_diegetic_render_context: Converts Diegetics to GPU-ready structures
-3. render_and_save_frame: Renders from camera and saves to disk
+2. setup_render_context: Converts Diegetics to GPU-ready structures + ColorLUTs
+3. render_and_save_all_aovs: Single render pass outputs all AOVs to disk
 
-Renders at 4K resolution (3840x2160) with object ID colors.
+Outputs files named {base}_{AOV}.{frame:04d}.png:
+- debug_all_visible_color.2920.png: Lit diffuse render
+- debug_all_visible_depth.2920.png: Depth visualization (closer = brighter)
+- debug_all_visible_normal.2920.png: Surface normal visualization
+- debug_all_visible_object_id.2920.png: Object ID colors (from USD primvar)
+- debug_all_visible_semantic.2920.png: Semantic segmentation colors (random per-object)
+
+Renders at 4K resolution (3840x2160).
 
 Usage: uv run python newton/examples/ces26/debug_all_visible_camera.py
 """
@@ -18,7 +25,6 @@ from pathlib import Path
 from pxr import Usd
 
 from ces26_utils import (
-    ColorChannel,
     ParseOptions,
     RenderConfig,
     get_camera_from_stage,
@@ -28,7 +34,7 @@ from ces26_utils import (
     parse_diegetics,
     primvar_color,
     random_color,
-    render_and_save_frame,
+    render_and_save_all_aovs,
     setup_render_context,
 )
 
@@ -44,7 +50,7 @@ RENDER_CONFIG = RenderConfig(
     width=3840,
     height=2160,
     output_dir=Path(__file__).parent,
-    filename_pattern="debug_all_visible_camera.{frame}.png",
+    filename_pattern="frame.{frame}.png",  # Pattern not used with multi-AOV output
 )
 
 # =============================================================================
@@ -98,18 +104,23 @@ def main():
     diegetics = make_diegetic_names_unique(diegetics)
     print(f"Loaded {len(diegetics)} diegetics")
 
-    # Phase 2: Setup render context with object_id colors
-    ctx, _ = setup_render_context(
-        diegetics,
-        RENDER_CONFIG,
-        channel=ColorChannel.OBJECT_ID,
-    )
+    # Phase 2: Setup render context (uses diffuse_albedo for lit pass) + ColorLUTs
+    ctx, color_luts, _ = setup_render_context(diegetics, RENDER_CONFIG)
 
-    # Phase 3: Render frames
+    # Phase 3: Render all AOVs for each frame
     for frame in FRAMES:
         time_code = Usd.TimeCode(frame)
         camera = get_camera_from_stage(stage, CAMERA_PATH, time_code, verbose=True)
-        render_and_save_frame(ctx, camera, RENDER_CONFIG, frame)
+        
+        # Single render pass outputs all AOVs
+        render_and_save_all_aovs(
+            ctx=ctx,
+            color_luts=color_luts,
+            camera=camera,
+            config=RENDER_CONFIG,
+            frame_num=frame,
+            base_name="debug_all_visible",
+        )
 
     print("\nDone!")
 
