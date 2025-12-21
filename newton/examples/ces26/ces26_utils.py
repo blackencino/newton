@@ -34,6 +34,13 @@ try:
 except ImportError:
     _PIL_AVAILABLE = False
 
+# Optional OpenEXR import for EXR output
+try:
+    import OpenEXR
+    _OPENEXR_AVAILABLE = True
+except ImportError:
+    _OPENEXR_AVAILABLE = False
+
 
 # =============================================================================
 # Multi-AOV Render Outputs
@@ -84,6 +91,22 @@ class PixelOutputs:
     normal: np.ndarray      # Normal visualization ((n+1)/2 mapped to 0-255)
     object_id: np.ndarray   # Object ID colors
     semantic: np.ndarray    # Semantic colors
+
+
+@dataclass
+class ExrOutputs:
+    """
+    Container for float arrays, ready for saving as OpenEXR files.
+    
+    All color arrays are (height, width, 3) float32.
+    Depth is (height, width) float32, normalized to [0, 1].
+    Normal is (height, width, 3) float32, mapped to [0, 1] from [-1, 1].
+    """
+    color: np.ndarray       # Lit diffuse render, float32 RGB in [0, 1]
+    depth: np.ndarray       # Normalized depth values, float32 in [0, 1] (0=near, 1=far)
+    normal: np.ndarray      # Surface normals mapped to [0, 1], float32
+    object_id: np.ndarray   # Object ID colors, float32 RGB in [0, 1]
+    semantic: np.ndarray    # Semantic colors, float32 RGB in [0, 1]
 
 
 # =============================================================================
@@ -338,7 +361,7 @@ def depth_to_colormap(
     """
     Convert depth values to colormap visualization with log transform.
     
-    Uses log_100 transform: log(1 + depth * 99) / log(100)
+    Uses log_250 transform: log(1 + depth * 249) / log(250)
     This spreads near values more evenly across the colormap.
     
     Closer = warm (high LUT index), Far = cool (low LUT index).
@@ -358,9 +381,9 @@ def depth_to_colormap(
     denom = wp.max(max_depth - min_depth, 0.001)
     normalized = (depth - min_depth) / denom
     
-    # Apply log_100 transform: spreads near values more evenly
-    # log(1 + x * 99) / log(100) maps [0,1] -> [0,1] with log stretching
-    log_base = 100.0
+    # Apply log_250 transform: spreads near values more evenly
+    # log(1 + x * 249) / log(250) maps [0,1] -> [0,1] with log stretching
+    log_base = 250.0
     transformed = wp.log(1.0 + normalized * (log_base - 1.0)) / wp.log(log_base)
     
     # Invert so closer = higher value (brighter/warmer in colormap)
@@ -898,7 +921,7 @@ def parse_diegetics(
             print(f"  PARSED: {path_str} ({len(geom.vertices)} verts, {len(geom.faces)} tris)")
     
     if show_progress:
-        print(f"  Done: {prims_processed} prims → {len(diegetics)} diegetics, {prims_skipped} skipped", flush=True)
+        print(f"  Done: {prims_processed} prims -> {len(diegetics)} diegetics, {prims_skipped} skipped", flush=True)
     
     return diegetics
 
@@ -1400,6 +1423,186 @@ def save_all_aovs(
     save_pixels_to_png(pixel_outputs.semantic, aov_path("semantic"))
 
 
+# =============================================================================
+# OpenEXR Output Support
+# =============================================================================
+
+def packed_uint32_to_float_rgb(packed: np.ndarray, height: int, width: int) -> np.ndarray:
+    """Convert packed RGBA uint32 array to float32 RGB array in [0, 1]."""
+    pixels = packed.reshape(height, width)
+    r = ((pixels >> 0) & 0xFF).astype(np.float32) / 255.0
+    g = ((pixels >> 8) & 0xFF).astype(np.float32) / 255.0
+    b = ((pixels >> 16) & 0xFF).astype(np.float32) / 255.0
+    return np.stack([r, g, b], axis=-1)
+
+
+def convert_aovs_to_exr_data(
+    outputs: RenderOutputs,
+    color_luts: ColorLUTs,
+    config: RenderConfig,
+) -> ExrOutputs:
+    """
+    Convert raw GPU render outputs to float32 arrays for OpenEXR saving.
+    
+    Values are normalized/mapped to [0, 1]:
+    - Depth is normalized to [0, 1] (0=near, 1=far, background=1)
+    - Normals are mapped from [-1, 1] to [0, 1]
+    
+    Args:
+        outputs: Raw RenderOutputs from render_all_aovs
+        color_luts: ColorLUTs for object_id and semantic mapping
+        config: Render configuration (for dimensions)
+        
+    Returns:
+        ExrOutputs with all passes as float32 arrays in [0, 1]
+    """
+    height, width = config.height, config.width
+    
+    # Color pass - convert packed uint32 to float RGB
+    color_rgb = packed_uint32_to_float_rgb(
+        outputs.color_image.numpy()[0, 0], height, width
+    )
+    
+    # Depth pass - normalize to 0-1
+    depth_raw = outputs.depth_image.numpy()[0, 0].reshape(height, width)
+    # Find valid depth range (exclude background = 0 or negative)
+    valid_mask = depth_raw > 0
+    if valid_mask.any():
+        min_depth = depth_raw[valid_mask].min()
+        max_depth = depth_raw[valid_mask].max()
+        denom = max(max_depth - min_depth, 0.001)
+        # Normalize: 0=near, 1=far
+        depth = np.where(valid_mask, (depth_raw - min_depth) / denom, 1.0)
+    else:
+        depth = np.ones_like(depth_raw)
+    
+    # Normal pass - map from [-1, 1] to [0, 1]
+    normal_raw = outputs.normal_image.numpy()[0, 0].reshape(height, width, 3)
+    normal = normal_raw * 0.5 + 0.5
+    
+    # Object ID pass - use LUT on shape indices
+    object_id_rgba = wp.zeros_like(outputs.color_image)
+    wp.launch(
+        shape_index_to_color_lut,
+        outputs.shape_index_image.shape,
+        [outputs.shape_index_image, color_luts.object_id, object_id_rgba],
+    )
+    object_id_rgb = packed_uint32_to_float_rgb(
+        object_id_rgba.numpy()[0, 0], height, width
+    )
+    
+    # Semantic pass - use LUT on shape indices
+    semantic_rgba = wp.zeros_like(outputs.color_image)
+    wp.launch(
+        shape_index_to_color_lut,
+        outputs.shape_index_image.shape,
+        [outputs.shape_index_image, color_luts.semantic, semantic_rgba],
+    )
+    semantic_rgb = packed_uint32_to_float_rgb(
+        semantic_rgba.numpy()[0, 0], height, width
+    )
+    
+    return ExrOutputs(
+        color=color_rgb.astype(np.float32),
+        depth=depth.astype(np.float32),
+        normal=normal.astype(np.float32),
+        object_id=object_id_rgb.astype(np.float32),
+        semantic=semantic_rgb.astype(np.float32),
+    )
+
+
+def save_exr_rgb(pixels: np.ndarray, output_path: Path) -> None:
+    """
+    Save RGB float array to OpenEXR file with half-float precision.
+    
+    Uses OpenEXR 3.x API with default ZIP compression.
+    
+    Args:
+        pixels: (height, width, 3) float32 array
+        output_path: Path to save the EXR file
+    """
+    if not _OPENEXR_AVAILABLE:
+        raise ImportError("OpenEXR package required for EXR output. Install with: uv pip install openexr")
+    
+    # Convert to half-float (float16) - OpenEXR 3.x detects dtype automatically
+    half_pixels = pixels.astype(np.float16)
+    
+    # Separate into channels
+    channels = {
+        "R": half_pixels[:, :, 0].copy(),
+        "G": half_pixels[:, :, 1].copy(),
+        "B": half_pixels[:, :, 2].copy(),
+    }
+    
+    # Create file with default compression (ZIP) and write
+    header = {"compression": OpenEXR.ZIP_COMPRESSION, "type": OpenEXR.scanlineimage}
+    exr_file = OpenEXR.File(header, channels)
+    exr_file.write(str(output_path))
+    
+    print(f"Saved: {output_path}")
+
+
+def save_exr_depth(depth: np.ndarray, output_path: Path) -> None:
+    """
+    Save single-channel depth to OpenEXR file with half-float precision.
+    
+    Uses OpenEXR 3.x API with default ZIP compression.
+    
+    Args:
+        depth: (height, width) float32 array
+        output_path: Path to save the EXR file
+    """
+    if not _OPENEXR_AVAILABLE:
+        raise ImportError("OpenEXR package required for EXR output. Install with: uv pip install openexr")
+    
+    # Convert to half-float
+    half_depth = depth.astype(np.float16)
+    
+    # Single Y channel for depth/luminance
+    channels = {"Y": half_depth.copy()}
+    
+    # Create file with default compression and write
+    header = {"compression": OpenEXR.ZIP_COMPRESSION, "type": OpenEXR.scanlineimage}
+    exr_file = OpenEXR.File(header, channels)
+    exr_file.write(str(output_path))
+    
+    print(f"Saved: {output_path}")
+
+
+def save_all_aovs_exr(
+    exr_outputs: ExrOutputs,
+    output_dir: Path,
+    frame_num: int,
+    base_name: str = "render",
+) -> None:
+    """
+    Save all AOV passes to disk as OpenEXR files with half-float precision.
+    
+    Creates files named {base}_{AOV}.{frame:04d}.exr:
+    - {base}_color.0001.exr: RGB color (half-float)
+    - {base}_depth.0001.exr: Single-channel depth (half-float)
+    - {base}_normal.0001.exr: RGB normals (half-float, values in [-1, 1])
+    - {base}_object_id.0001.exr: RGB object ID colors (half-float)
+    - {base}_semantic.0001.exr: RGB semantic colors (half-float)
+    
+    Args:
+        exr_outputs: ExrOutputs from convert_aovs_to_exr_data
+        output_dir: Directory to save files
+        frame_num: Frame number for filename (formatted as 4-digit zero-padded)
+        base_name: Base filename (before the AOV suffix)
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    def aov_path(aov: str) -> Path:
+        return output_dir / f"{base_name}_{aov}.{frame_num:04d}.exr"
+    
+    save_exr_rgb(exr_outputs.color, aov_path("color"))
+    save_exr_depth(exr_outputs.depth, aov_path("depth"))
+    save_exr_rgb(exr_outputs.normal, aov_path("normal"))
+    save_exr_rgb(exr_outputs.object_id, aov_path("object_id"))
+    save_exr_rgb(exr_outputs.semantic, aov_path("semantic"))
+
+
 def render_and_save_all_aovs(
     ctx: RenderContext,
     color_luts: ColorLUTs,
@@ -1407,14 +1610,14 @@ def render_and_save_all_aovs(
     config: RenderConfig,
     frame_num: int,
     base_name: str = "render",
-    ext: str = "png",
+    output_format: str = "png",
     depth_colormap: str = DepthColormap.MAGMA,
-) -> PixelOutputs:
+) -> PixelOutputs | ExrOutputs:
     """
     Render all AOVs and save them to disk.
     
-    Convenience function that combines render_all_aovs, convert_aovs_to_pixels,
-    and save_all_aovs.
+    Convenience function that combines render_all_aovs, convert_aovs_to_pixels/exr,
+    and save_all_aovs/exr.
     
     Args:
         ctx: RenderContext configured with scene geometry
@@ -1423,24 +1626,27 @@ def render_and_save_all_aovs(
         config: Render configuration (resolution, output dir)
         frame_num: Frame number for filename (formatted as 4-digit zero-padded)
         base_name: Base filename (before the AOV suffix)
-        ext: File extension (default: "png")
-        depth_colormap: Colormap for depth_heat (DepthColormap.VIRIDIS or .MAGMA)
+        output_format: Output format - "png" for uint8 PNG or "exr" for half-float OpenEXR
+        depth_colormap: Colormap for depth_heat (DepthColormap.VIRIDIS or .MAGMA, PNG only)
         
     Returns:
-        PixelOutputs with all passes as numpy arrays
+        PixelOutputs (for PNG) or ExrOutputs (for EXR) with all passes as numpy arrays
     """
-    print(f"Rendering frame {frame_num} (all AOVs)...")
+    print(f"Rendering frame {frame_num} (all AOVs, format={output_format})...")
     
     # Single render pass
     outputs = render_all_aovs(ctx, camera, config)
     
-    # Convert to pixels
-    pixel_outputs = convert_aovs_to_pixels(outputs, color_luts, config, depth_colormap)
-    
-    # Save all passes
-    save_all_aovs(pixel_outputs, config.output_dir, frame_num, base_name, ext)
-    
-    return pixel_outputs
+    if output_format.lower() == "exr":
+        # Convert to float data and save as EXR
+        exr_outputs = convert_aovs_to_exr_data(outputs, color_luts, config)
+        save_all_aovs_exr(exr_outputs, config.output_dir, frame_num, base_name)
+        return exr_outputs
+    else:
+        # Convert to pixels and save as PNG
+        pixel_outputs = convert_aovs_to_pixels(outputs, color_luts, config, depth_colormap)
+        save_all_aovs(pixel_outputs, config.output_dir, frame_num, base_name, output_format)
+        return pixel_outputs
 
 
 # =============================================================================

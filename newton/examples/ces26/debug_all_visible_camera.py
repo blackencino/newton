@@ -8,13 +8,22 @@ Uses the Diegetic functional pipeline from ces26_utils with multi-AOV output:
 2. setup_render_context: Converts Diegetics to GPU-ready structures + ColorLUTs
 3. render_and_save_all_aovs: Single render pass outputs all AOVs to disk
 
-Outputs files named {base}_{AOV}.{frame:04d}.png:
-- debug_all_visible_color.2920.png: Lit diffuse render
+Supports two output formats (set OUTPUT_FORMAT in config):
+
+PNG output ({base}_{AOV}.{frame:04d}.png):
+- debug_all_visible_color.2920.png: Lit diffuse render (uint8 RGB)
 - debug_all_visible_depth.2920.png: Depth visualization (grayscale, closer = brighter)
 - debug_all_visible_depth_heat.2920.png: Depth heat map (viridis or magma colormap)
-- debug_all_visible_normal.2920.png: Surface normal visualization
+- debug_all_visible_normal.2920.png: Surface normal visualization ((n+1)/2 mapped)
 - debug_all_visible_object_id.2920.png: Object ID colors (from USD primvar)
 - debug_all_visible_semantic.2920.png: Semantic segmentation colors (random per-object)
+
+EXR output ({base}_{AOV}.{frame:04d}.exr):
+- debug_all_visible_color.2920.exr: Lit diffuse render (half-float RGB, [0, 1])
+- debug_all_visible_depth.2920.exr: Normalized depth (half-float Y, [0, 1], 0=near 1=far)
+- debug_all_visible_normal.2920.exr: Surface normals (half-float RGB, [0, 1] mapped from [-1, 1])
+- debug_all_visible_object_id.2920.exr: Object ID colors (half-float RGB)
+- debug_all_visible_semantic.2920.exr: Semantic colors (half-float RGB)
 
 Renders at 4K resolution (3840x2160).
 
@@ -27,7 +36,9 @@ from pxr import Usd
 
 from ces26_utils import (
     DepthColormap,
+    ExrOutputs,
     ParseOptions,
+    PixelOutputs,
     RenderConfig,
     get_camera_from_stage,
     make_diegetic_names_unique,
@@ -48,7 +59,11 @@ USD_FILE = r"C:\Users\chorvath\Downloads\20251220_iv060_flat_02\Collected_202512
 CAMERA_PATH = "/World/TD060"
 FRAMES = [2920, 3130]
 
+# Output format: "png" for uint8 PNG, "exr" for half-float OpenEXR
+OUTPUT_FORMAT = "exr"  # or "png"
+
 # Depth heat map colormap: try MAGMA (warm) or VIRIDIS (cool-to-warm)
+# Note: Only used for PNG output (depth_heat pass)
 DEPTH_COLORMAP = DepthColormap.MAGMA  # or DepthColormap.VIRIDIS
 
 RENDER_CONFIG = RenderConfig(
@@ -125,6 +140,7 @@ def main():
             config=RENDER_CONFIG,
             frame_num=frame,
             base_name="debug_all_visible",
+            output_format=OUTPUT_FORMAT,
             depth_colormap=DEPTH_COLORMAP,
         )
 
