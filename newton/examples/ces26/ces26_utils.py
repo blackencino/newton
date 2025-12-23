@@ -23,7 +23,7 @@ from typing import Callable, Protocol
 
 import numpy as np
 import warp as wp
-from pxr import Gf, Usd, UsdGeom, UsdShade
+from pxr import Gf, Usd, UsdGeom, UsdLux, UsdShade
 
 from newton._src.sensors.warp_raytrace import ClearData, RenderContext, RenderShapeType
 
@@ -750,6 +750,433 @@ class CameraData:
     fov_horizontal: float     # Horizontal field of view in radians
 
 
+@dataclass
+class LightData:
+    """
+    Container for extracted USD light data.
+    
+    Supports both directional (distant) lights and positional lights.
+    The renderer uses:
+    - light_type: 0 = spotlight, 1 = directional
+    - position: World-space position (used for spotlights)
+    - direction: Light direction in world space (used for both types)
+    """
+    path: str
+    light_type: int           # 0 = spotlight, 1 = directional
+    position: np.ndarray      # World-space position (3,)
+    direction: np.ndarray     # Light direction in world space (3,), normalized
+    color: tuple[float, float, float]  # RGB color
+    intensity: float
+    cast_shadows: bool
+
+
+@dataclass
+class AmbientLightData:
+    """
+    Container for ambient/dome light data extracted from USD.
+    
+    Used to configure the renderer's ambient lighting based on DomeLights in the scene.
+    Since we don't support HDR environment maps yet, we use the dome light color
+    as a constant ambient color.
+    """
+    path: str
+    color: tuple[float, float, float]  # RGB color (sky/dome tint)
+    intensity: float                    # USD intensity value
+    
+    def get_normalized_color(self, target_intensity: float = 0.5) -> tuple[float, float, float]:
+        """
+        Get color normalized to a target intensity for ambient use.
+        
+        USD dome lights can have very high intensity values (100-1000+).
+        This normalizes to a reasonable ambient contribution level.
+        """
+        # Normalize the intensity to our target range
+        # Typical USD dome intensities are 100-500, we want 0.3-0.8 ambient
+        scale = min(1.0, self.intensity / 500.0) * target_intensity
+        return (
+            self.color[0] * scale,
+            self.color[1] * scale,
+            self.color[2] * scale,
+        )
+
+
+# =============================================================================
+# USD Light Extraction
+# =============================================================================
+
+def _get_light_direction_from_xform(
+    prim: Usd.Prim,
+    xcache: UsdGeom.XformCache,
+) -> np.ndarray:
+    """
+    Get the light direction from its transform.
+    
+    USD lights point down their local -Z axis by convention.
+    We transform the local -Z vector to world space.
+    """
+    world_mat = xcache.GetLocalToWorldTransform(prim)
+    
+    # Transform origin and -Z direction point
+    pts_local = np.array([[0, 0, 0], [0, 0, -1]], dtype=np.float64)
+    
+    # Transform to world space
+    M = np.array(world_mat, dtype=np.float64)
+    pts_h = np.concatenate([pts_local, np.ones((pts_local.shape[0], 1), dtype=np.float64)], axis=1)
+    pts_world_h = pts_h @ M
+    pts_world = pts_world_h[:, :3]
+    
+    origin, z_neg_pt = pts_world
+    direction = z_neg_pt - origin
+    norm = np.linalg.norm(direction)
+    if norm > 0:
+        direction = direction / norm
+    
+    return direction.astype(np.float32)
+
+
+def _get_light_position_from_xform(
+    prim: Usd.Prim,
+    xcache: UsdGeom.XformCache,
+) -> np.ndarray:
+    """Get the world-space position of a light from its transform."""
+    world_mat = xcache.GetLocalToWorldTransform(prim)
+    
+    # Transform origin
+    M = np.array(world_mat, dtype=np.float64)
+    origin = np.array([0, 0, 0, 1], dtype=np.float64)
+    origin_world = origin @ M
+    
+    return origin_world[:3].astype(np.float32)
+
+
+def _is_light_visible(prim: Usd.Prim, time_code: Usd.TimeCode) -> bool:
+    """
+    Check if a light prim is visible for rendering.
+    
+    Mirrors the visibility check we do for geometry.
+    """
+    # Lights can be UsdGeom.Imageable, check visibility
+    imageable = UsdGeom.Imageable(prim)
+    if imageable:
+        visibility = imageable.ComputeVisibility(time_code)
+        if visibility == UsdGeom.Tokens.invisible:
+            return False
+    return True
+
+
+def _extract_light_data(
+    prim: Usd.Prim,
+    xcache: UsdGeom.XformCache,
+    time_code: Usd.TimeCode,
+    check_visibility: bool = True,
+) -> LightData | None:
+    """
+    Extract light data from a USD light prim.
+    
+    Converts USD light types to our simplified light model:
+    - DistantLight -> directional (type 1)
+    - SphereLight, RectLight, etc. -> spotlight (type 0)
+    - DomeLight -> skipped (ambient, handled separately)
+    
+    Returns None if the prim is not a supported light type or is invisible.
+    """
+    # Skip dome lights (ambient) - we handle those separately
+    if prim.IsA(UsdLux.DomeLight):
+        return None
+    
+    # Check visibility
+    if check_visibility and not _is_light_visible(prim, time_code):
+        return None
+    
+    # Determine renderer light type
+    if prim.IsA(UsdLux.DistantLight):
+        light_type = 1  # directional
+    elif prim.IsA(UsdLux.SphereLight) or prim.IsA(UsdLux.RectLight) or prim.IsA(UsdLux.DiskLight):
+        light_type = 0  # spotlight (positional)
+    else:
+        return None
+    
+    # Get the light API for common properties
+    light = UsdLux.LightAPI(prim)
+    
+    # Extract color
+    color = (1.0, 1.0, 1.0)
+    color_attr = light.GetColorAttr()
+    if color_attr and color_attr.HasValue():
+        c = color_attr.Get(time_code)
+        if c:
+            color = (float(c[0]), float(c[1]), float(c[2]))
+    
+    # Extract intensity
+    intensity = 1.0
+    intensity_attr = light.GetIntensityAttr()
+    if intensity_attr and intensity_attr.HasValue():
+        intensity = float(intensity_attr.Get(time_code))
+    
+    # Extract shadow settings
+    cast_shadows = True
+    shadow_api = UsdLux.ShadowAPI(prim)
+    if shadow_api:
+        enable_attr = shadow_api.GetShadowEnableAttr()
+        if enable_attr and enable_attr.HasValue():
+            cast_shadows = bool(enable_attr.Get(time_code))
+    
+    # Get position and direction
+    position = _get_light_position_from_xform(prim, xcache)
+    direction = _get_light_direction_from_xform(prim, xcache)
+    
+    return LightData(
+        path=str(prim.GetPath()),
+        light_type=light_type,
+        position=position,
+        direction=direction,
+        color=color,
+        intensity=intensity,
+        cast_shadows=cast_shadows,
+    )
+
+
+def find_lights(
+    stage: Usd.Stage,
+    time_code: Usd.TimeCode,
+    path_filter: Callable[[str], bool] | None = None,
+    verbose: bool = False,
+) -> list[LightData]:
+    """
+    Find and extract all lights from a USD stage.
+    
+    Uses UsdLux.ListAPI for comprehensive light discovery.
+    Filters out DomeLights (ambient) as those are handled separately.
+    
+    Args:
+        stage: Opened USD stage
+        time_code: Time code for sampling animated lights
+        path_filter: Optional filter function (path -> bool) to exclude lights
+        verbose: If True, print discovered lights
+        
+    Returns:
+        List of LightData for directional and positional lights
+    """
+    xcache = UsdGeom.XformCache(time_code)
+    lights: list[LightData] = []
+    
+    # Try LightListAPI for comprehensive discovery
+    try:
+        light_list_api = UsdLux.ListAPI(stage.GetPseudoRoot())
+        light_paths = light_list_api.ComputeLightList(UsdLux.ListAPI.ComputeModeIgnoreCache)
+        
+        for path in light_paths:
+            # Apply path filter
+            path_str = str(path)
+            if path_filter and not path_filter(path_str):
+                continue
+            
+            prim = stage.GetPrimAtPath(path)
+            if prim and prim.IsValid():
+                light_data = _extract_light_data(prim, xcache, time_code, check_visibility=True)
+                if light_data:
+                    lights.append(light_data)
+                    if verbose:
+                        print(f"  Found light: {light_data.path} "
+                              f"(type={'directional' if light_data.light_type == 1 else 'positional'}, "
+                              f"dir=[{light_data.direction[0]:.3f}, {light_data.direction[1]:.3f}, {light_data.direction[2]:.3f}])")
+                elif verbose and not prim.IsA(UsdLux.DomeLight):
+                    # Light was skipped (invisible or unsupported type)
+                    if not _is_light_visible(prim, time_code):
+                        print(f"  Skipping invisible light: {path_str}")
+        
+    except AttributeError:
+        # Fallback: Traverse stage looking for light prims
+        for prim in stage.Traverse():
+            if prim.IsA(UsdLux.BoundableLightBase) or prim.IsA(UsdLux.NonboundableLightBase):
+                path_str = str(prim.GetPath())
+                if path_filter and not path_filter(path_str):
+                    continue
+                
+                light_data = _extract_light_data(prim, xcache, time_code)
+                if light_data:
+                    lights.append(light_data)
+    
+    return lights
+
+
+def get_default_light() -> LightData:
+    """
+    Get default directional light for scenes without USD lights.
+    
+    Returns a sun-like directional light pointing roughly downward.
+    """
+    return LightData(
+        path="/DefaultDirectionalLight",
+        light_type=1,  # directional
+        position=np.array([0.0, 0.0, 0.0], dtype=np.float32),
+        direction=np.array([-0.577, 0.577, -0.577], dtype=np.float32),  # 45° from above
+        color=(1.0, 1.0, 1.0),
+        intensity=1.0,
+        cast_shadows=True,
+    )
+
+
+def create_fill_light_from_ambient(
+    ambient: AmbientLightData | None,
+    key_light_direction: np.ndarray | None = None,
+) -> LightData:
+    """
+    Create a fill light based on the ambient/dome light from the USD scene.
+    
+    Since the renderer's ambient lighting is hardcoded, we simulate softer
+    ambient illumination by adding a fill light - a directional light from
+    roughly opposite the key light, with the dome light's color tint.
+    
+    This is similar to the classic key+fill lighting setup in cinematography.
+    
+    Args:
+        ambient: AmbientLightData from find_ambient_light(), or None for defaults
+        key_light_direction: Optional direction of the key light to compute fill direction
+        
+    Returns:
+        LightData for a fill light (no shadows, tinted by dome color)
+    """
+    # Default fill light direction: from below/front (opposite of typical key)
+    # If we have a key light, make fill come from roughly opposite direction
+    if key_light_direction is not None:
+        # Flip the key direction and shift toward camera-front
+        fill_dir = -key_light_direction
+        # Lift it up slightly so it's not purely from behind
+        fill_dir[2] = abs(fill_dir[2]) * 0.3  # Reduce vertical component
+        norm = np.linalg.norm(fill_dir)
+        if norm > 0:
+            fill_dir = fill_dir / norm
+    else:
+        # Default: from front-below at 45°
+        fill_dir = np.array([0.0, -0.707, 0.707], dtype=np.float32)
+    
+    # Get color and intensity from ambient light, or use warm fill defaults
+    if ambient:
+        # Use dome color, but reduce intensity significantly (fill is much dimmer than key)
+        # USD intensities are often 100-500, we want a subtle fill contribution
+        fill_intensity = min(1.0, ambient.intensity / 1000.0)  # ~0.2-0.5 for typical USD values
+        color = ambient.color
+    else:
+        # Warm fill light default (slight warmth to counteract cool ambient)
+        color = (1.0, 0.95, 0.9)
+        fill_intensity = 0.3
+    
+    return LightData(
+        path="/FillLight",
+        light_type=1,  # directional
+        position=np.array([0.0, 0.0, 0.0], dtype=np.float32),
+        direction=fill_dir.astype(np.float32),
+        color=color,
+        intensity=fill_intensity,
+        cast_shadows=False,  # Fill lights don't cast shadows
+    )
+
+
+def find_ambient_light(
+    stage: Usd.Stage,
+    time_code: Usd.TimeCode,
+    path_filter: Callable[[str], bool] | None = None,
+    verbose: bool = False,
+) -> AmbientLightData | None:
+    """
+    Find the primary DomeLight in the scene to use for ambient lighting.
+    
+    DomeLights in USD represent environment/sky lighting. Since we don't
+    support HDR environment maps, we extract the dome color and intensity
+    to use as a constant ambient color.
+    
+    Args:
+        stage: Opened USD stage
+        time_code: Time code for sampling
+        path_filter: Optional filter function to select specific dome light
+        verbose: If True, print found dome lights
+        
+    Returns:
+        AmbientLightData for the first matching DomeLight, or None if not found
+    """
+    # Try LightListAPI first
+    try:
+        light_list_api = UsdLux.ListAPI(stage.GetPseudoRoot())
+        light_paths = light_list_api.ComputeLightList(UsdLux.ListAPI.ComputeModeIgnoreCache)
+        
+        for path in light_paths:
+            path_str = str(path)
+            if path_filter and not path_filter(path_str):
+                continue
+            
+            prim = stage.GetPrimAtPath(path)
+            if prim and prim.IsValid() and prim.IsA(UsdLux.DomeLight):
+                # Check visibility
+                if not _is_light_visible(prim, time_code):
+                    if verbose:
+                        print(f"  Skipping invisible DomeLight: {path_str}")
+                    continue
+                
+                dome = UsdLux.DomeLight(prim)
+                light_api = UsdLux.LightAPI(prim)
+                
+                # Extract color
+                color = (1.0, 1.0, 1.0)
+                color_attr = light_api.GetColorAttr()
+                if color_attr and color_attr.HasValue():
+                    c = color_attr.Get(time_code)
+                    if c:
+                        color = (float(c[0]), float(c[1]), float(c[2]))
+                
+                # Extract intensity
+                intensity = 1.0
+                intensity_attr = light_api.GetIntensityAttr()
+                if intensity_attr and intensity_attr.HasValue():
+                    intensity = float(intensity_attr.Get(time_code))
+                
+                if verbose:
+                    print(f"  Found DomeLight: {path_str}")
+                    print(f"    Color: RGB({color[0]:.3f}, {color[1]:.3f}, {color[2]:.3f})")
+                    print(f"    Intensity: {intensity}")
+                
+                return AmbientLightData(
+                    path=path_str,
+                    color=color,
+                    intensity=intensity,
+                )
+    
+    except AttributeError:
+        # Fallback traversal
+        for prim in stage.Traverse():
+            if prim.IsA(UsdLux.DomeLight):
+                path_str = str(prim.GetPath())
+                if path_filter and not path_filter(path_str):
+                    continue
+                
+                light_api = UsdLux.LightAPI(prim)
+                
+                color = (1.0, 1.0, 1.0)
+                color_attr = light_api.GetColorAttr()
+                if color_attr and color_attr.HasValue():
+                    c = color_attr.Get(time_code)
+                    if c:
+                        color = (float(c[0]), float(c[1]), float(c[2]))
+                
+                intensity = 1.0
+                intensity_attr = light_api.GetIntensityAttr()
+                if intensity_attr and intensity_attr.HasValue():
+                    intensity = float(intensity_attr.Get(time_code))
+                
+                if verbose:
+                    print(f"  Found DomeLight: {path_str}")
+                    print(f"    Color: RGB({color[0]:.3f}, {color[1]:.3f}, {color[2]:.3f})")
+                    print(f"    Intensity: {intensity}")
+                
+                return AmbientLightData(
+                    path=path_str,
+                    color=color,
+                    intensity=intensity,
+                )
+    
+    return None
+
+
 # =============================================================================
 # Render Configuration
 # =============================================================================
@@ -1213,6 +1640,7 @@ def rgb_to_packed_uint32(r: float, g: float, b: float, a: float = 1.0) -> int:
 def setup_render_context(
     diegetics: list[Diegetic],
     config: RenderConfig,
+    lights: list[LightData] | None = None,
 ) -> tuple[RenderContext, ColorLUTs, list]:
     """
     Create RenderContext and ColorLUTs from Diegetics for multi-AOV rendering.
@@ -1229,6 +1657,7 @@ def setup_render_context(
     Args:
         diegetics: List of Diegetic scene elements
         config: Render configuration (resolution, output path)
+        lights: Optional list of LightData from USD scene. If None, uses default lighting.
         
     Returns:
         Tuple of (RenderContext, ColorLUTs, list of warp.Mesh objects)
@@ -1281,11 +1710,27 @@ def setup_render_context(
     ], dtype=np.float32)
     ctx.shape_colors = wp.array(diffuse_colors, dtype=wp.vec4f)
 
-    ctx.lights_active = wp.array([True], dtype=wp.bool)
-    ctx.lights_type = wp.array([1], dtype=wp.int32)
-    ctx.lights_cast_shadow = wp.array([True], dtype=wp.bool)
-    ctx.lights_position = wp.array([[0, 0, 0]], dtype=wp.vec3f)
-    ctx.lights_orientation = wp.array([[-0.577, 0.577, -0.577]], dtype=wp.vec3f)
+    # Set up lights - use provided lights or fall back to default
+    if lights and len(lights) > 0:
+        num_lights = len(lights)
+        print(f"Using {num_lights} lights from USD scene")
+        for l in lights:
+            light_type_str = "directional" if l.light_type == 1 else "positional"
+            print(f"  - {l.path}: {light_type_str}, dir=[{l.direction[0]:.3f}, {l.direction[1]:.3f}, {l.direction[2]:.3f}]")
+        
+        ctx.lights_active = wp.array([True] * num_lights, dtype=wp.bool)
+        ctx.lights_type = wp.array([l.light_type for l in lights], dtype=wp.int32)
+        ctx.lights_cast_shadow = wp.array([l.cast_shadows for l in lights], dtype=wp.bool)
+        ctx.lights_position = wp.array([l.position.tolist() for l in lights], dtype=wp.vec3f)
+        ctx.lights_orientation = wp.array([l.direction.tolist() for l in lights], dtype=wp.vec3f)
+    else:
+        # Default lighting: single directional light from above
+        print("Using default lighting (no USD lights provided)")
+        ctx.lights_active = wp.array([True], dtype=wp.bool)
+        ctx.lights_type = wp.array([1], dtype=wp.int32)  # directional
+        ctx.lights_cast_shadow = wp.array([True], dtype=wp.bool)
+        ctx.lights_position = wp.array([[0, 0, 0]], dtype=wp.vec3f)
+        ctx.lights_orientation = wp.array([[-0.577, 0.577, -0.577]], dtype=wp.vec3f)
 
     # Build ColorLUTs for post-processing shape_index to object_id and semantic
     object_id_lut = np.array([

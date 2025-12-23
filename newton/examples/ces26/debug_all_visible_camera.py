@@ -38,9 +38,13 @@ from pxr import Usd
 from ces26_utils import (
     DepthColormap,
     ExrOutputs,
+    LightData,
     ParseOptions,
     PixelOutputs,
     RenderConfig,
+    create_fill_light_from_ambient,
+    find_ambient_light,
+    find_lights,
     get_camera_from_stage,
     make_diegetic_names_unique,
     material_diffuse_extractor,
@@ -62,7 +66,7 @@ CAMERA_PATH = "/World/TD060"
 FRAMES = [2920, 3130]
 
 # Output format: "png" for uint8 PNG, "exr" for half-float OpenEXR
-OUTPUT_FORMAT = "exr"  # or "png"
+OUTPUT_FORMAT = "png"  # or "exr"
 
 # Depth heat map colormap: try MAGMA (warm) or VIRIDIS (cool-to-warm)
 # Note: Only used for PNG output (depth_heat pass)
@@ -99,10 +103,64 @@ SEMANTIC_EXTRACTOR = random_color(seed=42)
 
 def main():
     stage = open_usd_stage(USD_FILE)
+    time_code = Usd.TimeCode(FRAMES[0])
 
-    # Phase 1: Parse USD into Diegetics (geometry + all color channels)
+    # Phase 1a: Find lights in the USD scene
+    # Filter to use only /Environment lights (skip duplicates in BarbieColors)
+    def environment_light_filter(path: str) -> bool:
+        return path.startswith("/Environment/")
+    
+    lights = find_lights(
+        stage=stage,
+        time_code=time_code,
+        path_filter=environment_light_filter,
+        verbose=True,
+    )
+    print(f"Found {len(lights)} directional/positional lights from USD scene")
+    
+    # Phase 1a.2: Find ambient (DomeLight) and create a fill light
+    # Since the renderer has hardcoded ambient, we add a fill light to brighten shadows
+    ambient = find_ambient_light(
+        stage=stage,
+        time_code=time_code,
+        path_filter=environment_light_filter,
+        verbose=True,
+    )
+    
+    if ambient:
+        # Get key light direction if available
+        key_direction = lights[0].direction if lights else None
+        fill_light = create_fill_light_from_ambient(ambient, key_direction)
+        
+        # Artistic decision: drop fill light by 2 stops (multiply by 0.25)
+        # The renderer treats all lights equally (no per-light intensity),
+        # so we bake the reduction into the color
+        fill_exposure_reduction = 0.25  # 2 stops down
+        dimmed_color = (
+            fill_light.color[0] * fill_exposure_reduction,
+            fill_light.color[1] * fill_exposure_reduction,
+            fill_light.color[2] * fill_exposure_reduction,
+        )
+        # Create a new LightData with the dimmed color
+        from ces26_utils import LightData
+        fill_light = LightData(
+            path=fill_light.path,
+            light_type=fill_light.light_type,
+            position=fill_light.position,
+            direction=fill_light.direction,
+            color=dimmed_color,
+            intensity=fill_light.intensity,
+            cast_shadows=fill_light.cast_shadows,
+        )
+        
+        lights.append(fill_light)
+        print(f"Added fill light from DomeLight ({ambient.path})")
+        print(f"  Fill direction: [{fill_light.direction[0]:.3f}, {fill_light.direction[1]:.3f}, {fill_light.direction[2]:.3f}]")
+        print(f"  Fill color (after -2 stops): RGB({fill_light.color[0]:.3f}, {fill_light.color[1]:.3f}, {fill_light.color[2]:.3f})")
+
+    # Phase 1b: Parse USD into Diegetics (geometry + all color channels)
     options = ParseOptions(
-        time_code=Usd.TimeCode(FRAMES[0]),
+        time_code=time_code,
         path_filter=None,  # Load all visible meshes
         skip_invisible=True,
         skip_proxy=True,
@@ -126,8 +184,8 @@ def main():
     diegetics = make_diegetic_names_unique(diegetics)
     print(f"Loaded {len(diegetics)} diegetics")
 
-    # Phase 2: Setup render context (uses diffuse_albedo for lit pass) + ColorLUTs
-    ctx, color_luts, _ = setup_render_context(diegetics, RENDER_CONFIG)
+    # Phase 2: Setup render context with USD lights + ColorLUTs
+    ctx, color_luts, _ = setup_render_context(diegetics, RENDER_CONFIG, lights=lights)
 
     # Phase 3: Render all AOVs for each frame
     for frame in FRAMES:
