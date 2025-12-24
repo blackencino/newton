@@ -137,14 +137,14 @@ def compute_distance_colored_groups(
         
         # Select gradient based on category
         if group.category == GroupCategory.GROUND_TERRAIN:
-            color_rgb = gradient_cool(t)
+            # Keep original objectid_color for terrain/bg
+            new_color = group.objectid_color
         elif group.category == GroupCategory.UNSAFE:
             color_rgb = gradient_hot(t)
+            new_color = (float(color_rgb[0]), float(color_rgb[1]), float(color_rgb[2]))
         else:  # SAFE
             color_rgb = gradient_happy(t)
-        
-        # Convert to tuple
-        new_color: RGB = (float(color_rgb[0]), float(color_rgb[1]), float(color_rgb[2]))
+            new_color = (float(color_rgb[0]), float(color_rgb[1]), float(color_rgb[2]))
         category_counts[group.category] += 1
         
         # Create new group with updated color
@@ -317,6 +317,27 @@ def load_diegetics_from_usd_with_cache(
 
 
 # =============================================================================
+# Custom kernel with configurable background color
+# =============================================================================
+
+@wp.kernel
+def shape_index_to_color_lut_with_bg(
+    shape_indices: wp.array(dtype=wp.uint32, ndim=3),
+    color_lut: wp.array(dtype=wp.uint32),
+    bg_color: wp.uint32,
+    out_rgba: wp.array(dtype=wp.uint32, ndim=3),
+):
+    """Map shape indices to colors using a lookup table, with custom background color."""
+    world_id, camera_id, pixel_id = wp.tid()
+    shape_index = shape_indices[world_id, camera_id, pixel_id]
+    if shape_index < wp.uint32(color_lut.shape[0]):
+        out_rgba[world_id, camera_id, pixel_id] = color_lut[wp.int32(shape_index)]
+    else:
+        # Background or invalid - use provided background color
+        out_rgba[world_id, camera_id, pixel_id] = bg_color
+
+
+# =============================================================================
 # Render semantic AOV only
 # =============================================================================
 
@@ -338,10 +359,17 @@ def render_semantic_aov(
     
     from ces26_utils import (
         transforms_and_rays_from_camera_data,
-        shape_index_to_color_lut,
         packed_uint32_to_rgb,
     )
     from newton._src.sensors.warp_raytrace import ClearData
+    
+    # Use gradient_cool(0) as background color instead of gray
+    # Packed format is 0xAABBGGRR (blue in bits 16-23, red in bits 0-7)
+    bg_rgb = gradient_cool(0.0)
+    bg_r = int(bg_rgb[0] * 255)
+    bg_g = int(bg_rgb[1] * 255)
+    bg_b = int(bg_rgb[2] * 255)
+    bg_color_packed = 0xFF000000 | (bg_b << 16) | (bg_g << 8) | bg_r
     
     print(f"Rendering frame {frame_num} (semantic AOV only)...")
     
@@ -359,15 +387,15 @@ def render_semantic_aov(
         camera_rays=camera_rays,
         shape_index_image=shape_index_image,
         refit_bvh=True,
-        clear_data=ClearData(clear_color=0xFF404040),
+        clear_data=ClearData(clear_color=bg_color_packed),
     )
     
-    # Map shape indices to semantic colors using LUT
+    # Map shape indices to semantic colors using LUT with custom background
     semantic_rgba = wp.zeros_like(shape_index_image)
     wp.launch(
-        shape_index_to_color_lut,
+        shape_index_to_color_lut_with_bg,
         shape_index_image.shape,
-        [shape_index_image, color_luts.semantic, semantic_rgba],
+        [shape_index_image, color_luts.semantic, wp.uint32(bg_color_packed), semantic_rgba],
     )
     
     # Convert to RGB
