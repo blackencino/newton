@@ -13,7 +13,7 @@ Run with: uv run python newton/examples/ces26/dynamic_segmentation/test_utils.py
 
 import numpy as np
 
-from utils import (
+from dynamic_segmentation.utils import (
     BodyCentricMeasurements,
     BoundingEllipsoid,
     compose_transforms,

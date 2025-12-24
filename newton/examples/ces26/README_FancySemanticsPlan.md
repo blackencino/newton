@@ -16,6 +16,9 @@ semantic segmentation colors for groups of diagetic elements in this scene. Beca
 USD file is so big, we want to first create a utility to parse through the USD and
 extract metadata about the diagetic elements.
 
+## IMPORTANT NOTE README!
+Use the actual USD file from disk: ```USD_FILE = r"C:\Users\chorvath\Downloads\20251223_iv060_flat_04\Collected_20251223_iv060_flat_04\20251223_iv060_flat_04.usd"```. Please look at the actual path and prim names of this *specific* shot to inform the ground/terrain and hanging lantern/chain heuristics. We don't need the totally generic approach, and we don't need the tests that create fake scenes with hypothetical data - all we care about is this one, specific shot. This work is very production-focused, it is in service of producing this *actual* shot's images on a very short timeframe - this is not a general-purpose long-term segmentation algorithm or implementation.
+
 ## Preamble:
 All code is functional, uses immutable value semantics. Rely on the reference-counted
 nature of underlying tensors and arrays, don't sweat guaranteeing that the underlying

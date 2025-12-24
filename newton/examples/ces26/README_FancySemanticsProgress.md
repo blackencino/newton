@@ -3,13 +3,17 @@
 This log tracks implementation progress for the preprocessing pipeline described in
 `README_FancySemanticsPlan.md`.
 
+**USD File:** `C:\Users\chorvath\Downloads\20251223_iv060_flat_04\Collected_20251223_iv060_flat_04\20251223_iv060_flat_04.usd`  
+**Camera:** `/World/TD060`  
+**Frames:** 2920-3130 (211 frames)
+
 ---
 
 ## Step 0: Utils ✓
 
 **Status:** Complete  
 **Date:** 2025-12-23  
-**Files Created:**
+**Files:**
 - `dynamic_segmentation/utils.py` - Core utilities
 - `dynamic_segmentation/__init__.py` - Package init with exports
 - `dynamic_segmentation/test_utils.py` - Test script
@@ -23,47 +27,103 @@ This log tracks implementation progress for the preprocessing pipeline described
 - `compose_transforms()` - Chain transforms left-to-right
 
 **Body-Centric Measurements:**
-- `BoundingEllipsoid` dataclass:
-  - `center_world`, `radii`, `body_axes_world`
-  - `distance_to_point()` - Approximate distance using spherical cow normalization
-  - `contains_point()` - Membership test
-  
-- `BodyCentricMeasurements` dataclass:
-  - `centroid` - Mean vertex position
-  - `centered_T_world` - Translation to centered space
-  - `covariance` - 3×3 covariance matrix
-  - `eigenvalues` / `eigenvectors` - SVD decomposition (sorted descending)
-  - `body_T_centered` - Rotation to body frame (right-handed, axis0=max, axis2=min)
-  - `sphericalCow_T_body` - Scale to roughly spherical
-  - `unitSphericalCow_T_sphericalCow` - Scale to unit radius
-  - `unitSphericalCow_T_centered` - Composed transform
-  - `max_body_radius` - Radius before unit normalization
-  - `bounding_ellipsoid` - World-space ellipsoid
-
+- `BoundingEllipsoid` dataclass with `distance_to_point()`, `contains_point()`
+- `BodyCentricMeasurements` dataclass with centroid, covariance, SVD, body frame transforms
 - `compute_body_centric_measurements()` - Main computation from world-space vertices
-
-### Tests:
-All tests pass:
-- USD to Craig conversion (transpose verification)
-- Point transformation (translation, rotation)
-- Transform composition (order verification)
-- Sphere point cloud (isotropic eigenvalues)
-- Elongated shape (correct axis alignment, eigenvalue ratios)
-- Ellipsoid distance calculations (inside/surface/outside)
 
 ---
 
 ## Step 1: Pre-processing USD into semantic setup
 
-**Status:** Not started
+**Status:** Partially Complete (functional but needs refinement)  
+**Date:** 2025-12-23  
+**Files:**
+- `dynamic_segmentation/preprocess.py` - Main preprocessing module
+- `dynamic_segmentation/test_preprocess.py` - Test on real USD (slow ~30s)
+- `run_preprocessing.py` - Script to run full pipeline
 
-### Pending Tasks:
-1. `DiageticMetadata` dataclass and parse function
-2. `DiageticGroupMetadata` and grouping logic (by scene graph + objectid_color)
-3. `CameraCurve` extraction for full frame range (2920-3130)
-4. Path danger computation (camera to ellipsoid distance curve)
-5. Group categorization (Ground/Terrain, Unsafe, Safe)
-6. NPZ cache save/load for preprocessing results
+### Implemented:
+
+1. **DiageticMetadata** ✓ - Lightweight per-mesh metadata
+2. **parse_diagetic_metadata()** ✓ - Parses USD, returns 2449 diegetics
+3. **DiageticGroupMetadata** ✓ - Grouped diegetics with body measurements
+4. **group_diagetics_by_color_and_ancestor()** ✓ - Groups by (color, colored_root), creates 68 groups
+5. **CameraCurve** ✓ - Pre-baked camera animation
+6. **extract_camera_curve()** ✓ - Extracts camera positions over frame range
+7. **compute_path_danger()** ✓ - Distance from camera to ellipsoid
+8. **update_groups_with_path_danger()** ✓ - Batch update all groups
+9. **GroupCategory** ✓ - Enum: GROUND_TERRAIN, UNSAFE, SAFE
+10. **categorize_group()** ✓ - Pattern matching on paths
+11. **update_groups_with_categories()** ✓ - Batch categorization
+12. **save_preprocessing_cache()** / **load_preprocessing_cache()** ✓ - NPZ serialization
+13. **run_preprocessing_pipeline()** ✓ - High-level pipeline function
+
+### Shot-Specific Scene Structure (IV060):
+
+```
+/World/
+├── StarWarsSet_01/assembly/          # Main set (1894 meshes, 18 color-groups)
+│   ├── Terrain_01/geo/               # Ground terrain (2 meshes)
+│   ├── ClothModuleX_YY/              # Fabric/cloth elements
+│   ├── CrateX_YY/                    # Crates and boxes
+│   ├── PotteryX_YY/                  # Pottery objects
+│   ├── TentMainA_YY/                 # Tent structures
+│   └── ... many more props
+├── HangingLanternA_01/               # Lantern type A (67 meshes each)
+├── HangingLanternA_02/
+├── HangingLanternA_03/
+├── HangingLanternB_01/               # Lantern type B (6 meshes each)
+├── HangingLanternC_01/               # Lantern type C (33 meshes each)
+├── HangingLanternChainA_01/          # Chain links (1-3 meshes each)
+├── SimGravelLrg_01/                  # Gravel simulation (not rendered)
+├── BDXDroid_01/                      # Droid character
+├── TD060                             # Camera
+└── ... other props
+```
+
+### Categorization Heuristics (Shot-Specific):
+
+**GROUND_TERRAIN:** Paths containing `/Terrain_01/` in member_paths  
+**SAFE:** Paths containing `hanginglantern` (any variant)  
+**UNSAFE:** Everything else (default)
+
+Note: `SimGravelLrg_01` is a point simulation cache and doesn't render in this pass.
+
+### Current Test Results:
+- 2449 diegetics parsed (skipping proxy geometry)
+- 68 groups created (by color + ancestor subtree)
+- 26 SAFE groups (all lanterns/chains correctly identified)
+- 1 GROUND_TERRAIN group (terrain meshes in StarWarsSet_01)
+- 41 UNSAFE groups (props, crates, structures)
+
+### Known Issues / Next Steps:
+
+1. **Grouping granularity**: Multiple assets within `StarWarsSet_01` share the same 
+   `objectid_color`, causing them to be grouped together by color. The terrain meshes
+   end up in a large group with other objects that share the same color. The current
+   categorization uses member_paths to detect terrain within these mixed groups.
+
+2. **Gravel not handled**: `SimGravelLrg_01` is a simulation point cache that doesn't
+   produce rendered geometry in our raytracer pass - it can be ignored.
+
+3. **Tests are slow**: The test script parses the real 12GB USD file and takes ~30s.
+   Consider caching the preprocessing results to disk for faster iteration.
+
+### To Continue This Work:
+
+```bash
+# Run from newton/examples/ces26 directory
+cd newton/examples/ces26
+
+# Run utils tests (fast)
+uv run python -m dynamic_segmentation.test_utils
+
+# Run preprocessing test on real USD (slow, ~30s)
+uv run python -m dynamic_segmentation.test_preprocess
+
+# Run full preprocessing pipeline and save cache
+uv run python run_preprocessing.py
+```
 
 ---
 
