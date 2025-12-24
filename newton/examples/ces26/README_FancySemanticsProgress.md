@@ -33,81 +33,102 @@ This log tracks implementation progress for the preprocessing pipeline described
 
 ---
 
-## Step 1: Pre-processing USD into semantic setup
+## Step 1: Pre-processing USD into semantic setup ✓
 
-**Status:** Partially Complete (functional but needs refinement)  
-**Date:** 2025-12-23  
+**Status:** Complete  
+**Date:** 2025-12-24  
 **Files:**
 - `dynamic_segmentation/preprocess.py` - Main preprocessing module
-- `dynamic_segmentation/test_preprocess.py` - Test on real USD (slow ~30s)
-- `run_preprocessing.py` - Script to run full pipeline
+- `run_preprocess_v2.py` - Script to run updated pipeline
+- Cache: `D:\ces26_data\td060\v04\preprocess_v2.npz` (65 KB)
+
+### Grouping Strategy: "Parent of geo"
+
+The flattened USD follows a consistent pattern:
+```
+/World/{AssetName}/geo/{meshes...}
+/World/StarWarsSet_01/assembly/{AssetName}/geo/{meshes...}
+```
+
+The **asset root** is the PARENT of the `geo` prim. This gives semantically-correct
+groups where each lantern, crate, terrain, etc. is its own group.
 
 ### Implemented:
 
 1. **DiageticMetadata** ✓ - Lightweight per-mesh metadata
-2. **parse_diagetic_metadata()** ✓ - Parses USD, returns 2449 diegetics
+2. **parse_diagetic_metadata()** ✓ - Parses USD, returns 2442 diegetics
 3. **DiageticGroupMetadata** ✓ - Grouped diegetics with body measurements
-4. **group_diagetics_by_color_and_ancestor()** ✓ - Groups by (color, colored_root), creates 68 groups
-5. **CameraCurve** ✓ - Pre-baked camera animation
-6. **extract_camera_curve()** ✓ - Extracts camera positions over frame range
-7. **compute_path_danger()** ✓ - Distance from camera to ellipsoid
-8. **update_groups_with_path_danger()** ✓ - Batch update all groups
-9. **GroupCategory** ✓ - Enum: GROUND_TERRAIN, UNSAFE, SAFE
-10. **categorize_group()** ✓ - Pattern matching on paths
-11. **update_groups_with_categories()** ✓ - Batch categorization
-12. **save_preprocessing_cache()** / **load_preprocessing_cache()** ✓ - NPZ serialization
-13. **run_preprocessing_pipeline()** ✓ - High-level pipeline function
+4. **group_diagetics_by_asset_root()** ✓ - Groups by asset root, creates 132 groups
+5. **_find_asset_root()** ✓ - Finds parent of 'geo' prim
+6. **_is_excluded_path()** ✓ - Filters out PaintTool and Sphere
+7. **CameraCurve** ✓ - Pre-baked camera animation
+8. **extract_camera_curve()** ✓ - Extracts camera positions over frame range
+9. **compute_path_danger()** ✓ - Distance from camera to ellipsoid
+10. **update_groups_with_path_danger()** ✓ - Batch update all groups
+11. **GroupCategory** ✓ - Enum: GROUND_TERRAIN, UNSAFE, SAFE
+12. **categorize_group()** ✓ - Pattern matching on paths
+13. **update_groups_with_categories()** ✓ - Batch categorization
+14. **save_preprocessing_cache()** / **load_preprocessing_cache()** ✓ - NPZ serialization
+15. **run_preprocessing_pipeline()** ✓ - High-level pipeline function
 
 ### Shot-Specific Scene Structure (IV060):
 
 ```
 /World/
-├── StarWarsSet_01/assembly/          # Main set (1894 meshes, 18 color-groups)
-│   ├── Terrain_01/geo/               # Ground terrain (2 meshes)
-│   ├── ClothModuleX_YY/              # Fabric/cloth elements
-│   ├── CrateX_YY/                    # Crates and boxes
-│   ├── PotteryX_YY/                  # Pottery objects
-│   ├── TentMainA_YY/                 # Tent structures
-│   └── ... many more props
-├── HangingLanternA_01/               # Lantern type A (67 meshes each)
-├── HangingLanternA_02/
-├── HangingLanternA_03/
-├── HangingLanternB_01/               # Lantern type B (6 meshes each)
-├── HangingLanternC_01/               # Lantern type C (33 meshes each)
-├── HangingLanternChainA_01/          # Chain links (1-3 meshes each)
-├── SimGravelLrg_01/                  # Gravel simulation (not rendered)
-├── BDXDroid_01/                      # Droid character
-├── TD060                             # Camera
-└── ... other props
+├── StarWarsSet_01/assembly/          # Main set (90 assets inside)
+│   ├── Terrain_01/geo/               # Ground terrain (3 meshes)
+│   ├── TentMainA_06/geo/             # Tent (155 meshes)
+│   ├── GearPartsShelfA_01/geo/       # Shelf (75 meshes)
+│   ├── CommsA_03/geo/                # Comms (55 meshes)
+│   └── ... 86 more assets
+├── HangingLanternA/geo/              # Lantern type A (67 meshes)
+├── HangingLanternA_01/geo/           # Lantern type A instance (67 meshes)
+├── HangingLanternA_02/geo/           # Lantern type A instance (67 meshes)
+├── HangingLanternB/geo/              # Lantern type B (6 meshes)
+├── HangingLanternC/geo/              # Lantern type C (33 meshes)
+├── HangingLanternChain*/geo/         # Chain links (1-3 meshes each)
+├── CrateA/geo/                       # Crate (11 meshes)
+├── GearA/geo/                        # Gear (1 mesh)
+├── TD060                             # Camera (not rendered)
+└── ... 42 top-level assets total
 ```
+
+### Grouping Strategy:
+
+**Asset Root = Parent of 'geo' prim**
+
+This correctly groups each asset (lantern, crate, tent) as a single semantic unit,
+regardless of how many sub-meshes it contains.
 
 ### Categorization Heuristics (Shot-Specific):
 
-**GROUND_TERRAIN:** Paths containing `/Terrain_01/` in member_paths  
-**SAFE:** Paths containing `hanginglantern` (any variant)  
+**GROUND_TERRAIN:** Asset root contains `Terrain`  
+**SAFE:** Asset root contains `hanginglantern` (any variant)  
 **UNSAFE:** Everything else (default)
 
-Note: `SimGravelLrg_01` is a point simulation cache and doesn't render in this pass.
+### Excluded Paths:
+- `/World/PaintTool/*` - Point instancer scatter (not renderable)
+- `/World/Sphere` - Debug geometry
 
-### Current Test Results:
-- 2449 diegetics parsed (skipping proxy geometry)
-- 68 groups created (by color + ancestor subtree)
+### Current Test Results (V2):
+- 2442 diegetics parsed (excluding 7 orphans)
+- 132 asset groups created (by hierarchy)
 - 26 SAFE groups (all lanterns/chains correctly identified)
-- 1 GROUND_TERRAIN group (terrain meshes in StarWarsSet_01)
-- 41 UNSAFE groups (props, crates, structures)
+- 1 GROUND_TERRAIN group (Terrain_01 with 3 meshes)
+- 105 UNSAFE groups (props, crates, structures)
 
-### Known Issues / Next Steps:
+### Resolved Issues:
 
-1. **Grouping granularity**: Multiple assets within `StarWarsSet_01` share the same 
-   `objectid_color`, causing them to be grouped together by color. The terrain meshes
-   end up in a large group with other objects that share the same color. The current
-   categorization uses member_paths to detect terrain within these mixed groups.
+1. **Grouping granularity** ✓ - Fixed by switching from color-based to hierarchy-based
+   grouping. Now each asset (lantern, crate, terrain) is its own group.
 
-2. **Gravel not handled**: `SimGravelLrg_01` is a simulation point cache that doesn't
-   produce rendered geometry in our raytracer pass - it can be ignored.
+2. **Excluded geometry** ✓ - PaintTool and Sphere are now excluded from processing.
 
-3. **Tests are slow**: The test script parses the real 12GB USD file and takes ~30s.
-   Consider caching the preprocessing results to disk for faster iteration.
+### Notes:
+
+- Preprocessing takes ~70s (mostly USD parsing + body measurements)
+- Cache file is only 65 KB (metadata only, no geometry)
+- Geometry cache (633 MB) is NOT recommended - re-parsing USD is faster
 
 ---
 
@@ -160,15 +181,16 @@ cd newton/examples/ces26
 # Run utils tests (fast)
 uv run python -m dynamic_segmentation.test_utils
 
-# Run preprocessing test on real USD (slow, ~30s)
-uv run python -m dynamic_segmentation.test_preprocess
+# Run V2 preprocessing (hierarchy-based, ~70s)
+uv run python run_preprocess_v2.py
 
-# Run full preprocessing and test save/load
-uv run python run_preprocess_test.py
-
-# Examine groups and cache contents
-uv run python run_preprocess_test2.py
+# Analyze USD hierarchy and asset structure
+uv run python analyze_assets.py
+uv run python dump_hierarchy.py
 ```
+
+### Cache Files:
+- `D:\ces26_data\td060\v04\preprocess_v2.npz` - Latest preprocessing cache (65 KB)
 
 ---
 

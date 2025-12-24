@@ -5,10 +5,18 @@ Preprocessing pipeline for dynamic segmentation of USD scenes.
 
 This module parses a USD scene and extracts:
 - DiageticMetadata: Lightweight per-mesh metadata (no heavy geometry arrays)
-- DiageticGroupMetadata: Grouped diegetics by scene graph + objectid_color
+- DiageticGroupMetadata: Grouped diegetics by asset root (parent of 'geo' prim)
 - CameraCurve: Pre-baked camera animation over frame range
 - Path danger values: Distance from camera to each group's bounding ellipsoid
 - Group categories: Ground/Terrain, Unsafe, Safe
+
+Grouping Strategy:
+  The flattened USD follows a consistent pattern:
+    /World/{AssetName}/geo/{meshes...}
+    /World/StarWarsSet_01/assembly/{AssetName}/geo/{meshes...}
+  
+  The "asset root" is the PARENT of the 'geo' prim. All meshes under the same
+  asset root are grouped together as a single semantic object.
 
 All data can be cached to disk as NPZ to avoid re-parsing the large USD file.
 """
@@ -105,6 +113,40 @@ def _get_objectid_color(prim: Usd.Prim, time_code: Usd.TimeCode) -> RGB | None:
 def _is_proxy_path(path: str) -> bool:
     """Check if a prim path appears to be proxy geometry."""
     return "/proxy/" in path.lower()
+
+
+# Paths to exclude from diegetic processing (non-renderable or debug geometry)
+_EXCLUDED_PATH_PREFIXES = (
+    "/World/PaintTool",  # Point instancer scatter geometry (not supported)
+    "/World/Sphere",     # Debug/utility object
+)
+
+
+def _is_excluded_path(path: str) -> bool:
+    """Check if a prim path should be excluded from diegetic processing."""
+    return path.startswith(_EXCLUDED_PATH_PREFIXES)
+
+
+def _find_asset_root(mesh_path: str) -> str | None:
+    """
+    Find the asset root for a mesh by looking for the parent of 'geo' in the path.
+    
+    The flattened USD follows a consistent pattern:
+      /World/HangingLanternA_01/geo/part001 -> /World/HangingLanternA_01
+      /World/StarWarsSet_01/assembly/Terrain_01/geo/mesh -> /World/StarWarsSet_01/assembly/Terrain_01
+    
+    Returns None if no 'geo' is found in the path.
+    """
+    parts = mesh_path.split("/")
+    
+    # Find the 'geo' component
+    for i, part in enumerate(parts):
+        if part == "geo":
+            # Return everything up to (but not including) 'geo'
+            if i > 0:
+                return "/".join(parts[:i])
+    
+    return None
 
 
 def _is_visible_mesh(prim: Usd.Prim, time_code: Usd.TimeCode) -> bool:
@@ -281,6 +323,13 @@ def parse_diagetic_metadata(
         if skip_proxy and _is_proxy_path(path_str):
             if verbose:
                 print(f"  SKIP (proxy): {path_str}")
+            prims_skipped += 1
+            continue
+
+        # Filter: excluded paths (non-renderable geometry like PaintTool, debug objects)
+        if _is_excluded_path(path_str):
+            if verbose:
+                print(f"  SKIP (excluded): {path_str}")
             prims_skipped += 1
             continue
 
@@ -629,6 +678,162 @@ def make_group_names_unique(
         result[group_id] = group
 
     return result
+
+
+def group_diagetics_by_asset_root(
+    mesh_data_list: list[_ExtractedMeshData],
+    time_code: Usd.TimeCode,
+    verbose: bool = False,
+    show_progress: bool = True,
+) -> dict[str, DiageticGroupMetadata]:
+    """
+    Group diegetics by asset root (parent of 'geo' prim in path).
+
+    This is the preferred grouping strategy for flattened USD files where each
+    asset follows the pattern:
+        /World/{AssetName}/geo/{meshes...}
+        /World/StarWarsSet_01/assembly/{AssetName}/geo/{meshes...}
+
+    All meshes under the same asset root are grouped together as a single
+    semantic object (e.g., a lantern with 67 parts becomes one group).
+
+    Args:
+        mesh_data_list: List of extracted mesh data with geometry
+        time_code: Time code for sampling (used to get objectid_color)
+        verbose: Print detailed progress
+        show_progress: Print progress updates
+
+    Returns:
+        Dictionary mapping group_id to DiageticGroupMetadata
+    """
+    from collections import defaultdict
+
+    if show_progress:
+        print("Grouping diegetics by asset root (parent of 'geo')...", flush=True)
+
+    # Group meshes by their asset root
+    asset_groups: dict[str, list[_ExtractedMeshData]] = defaultdict(list)
+    orphan_meshes: list[_ExtractedMeshData] = []
+
+    for mesh in mesh_data_list:
+        asset_root = _find_asset_root(mesh.metadata.path)
+        if asset_root:
+            asset_groups[asset_root].append(mesh)
+        else:
+            orphan_meshes.append(mesh)
+
+    if show_progress:
+        print(f"  Found {len(asset_groups)} asset roots")
+        if orphan_meshes:
+            print(f"  {len(orphan_meshes)} orphan meshes (no 'geo' in path)")
+
+    groups: dict[str, DiageticGroupMetadata] = {}
+    group_counter = 0
+
+    for asset_root, meshes in sorted(asset_groups.items()):
+        # Get objectid_color from first mesh that has one (they usually all match)
+        objectid_color: RGB = (0.5, 0.5, 0.5)  # Default gray
+        for m in meshes:
+            if m.metadata.objectid_color is not None:
+                objectid_color = m.metadata.objectid_color
+                break
+
+        paths = [m.metadata.path for m in meshes]
+
+        # Concatenate all vertices for body-centric measurements
+        all_vertices = np.vstack([m.vertices_world for m in meshes])
+
+        # Compute bounding box
+        bbox_min = all_vertices.min(axis=0)
+        bbox_max = all_vertices.max(axis=0)
+
+        # Compute body-centric measurements
+        body_measurements = compute_body_centric_measurements(all_vertices)
+
+        # Generate group ID and unique name from the asset root
+        group_id = f"asset_{group_counter:04d}"
+        short_name = asset_root.split("/")[-1]
+        unique_name = short_name
+
+        # Statistics
+        total_verts = sum(m.metadata.vertex_count for m in meshes)
+        total_tris = sum(m.metadata.triangle_count for m in meshes)
+
+        group = DiageticGroupMetadata(
+            group_id=group_id,
+            unique_name=unique_name,
+            common_ancestor_path=asset_root,
+            objectid_color=objectid_color,
+            member_paths=tuple(paths),
+            member_count=len(meshes),
+            total_vertex_count=total_verts,
+            total_triangle_count=total_tris,
+            bbox_min=bbox_min.astype(np.float32),
+            bbox_max=bbox_max.astype(np.float32),
+            bounding_ellipsoid=body_measurements.bounding_ellipsoid,
+            path_danger=float("inf"),  # Computed later
+            category=GroupCategory.UNSAFE,  # Computed later
+        )
+
+        groups[group_id] = group
+        group_counter += 1
+
+        if verbose:
+            print(
+                f"  {group_id}: {unique_name} ({len(meshes)} meshes, "
+                f"{total_verts} verts, root={asset_root})"
+            )
+
+    # Handle orphan meshes - group by immediate parent
+    if orphan_meshes:
+        orphan_parents: dict[str, list[_ExtractedMeshData]] = defaultdict(list)
+        for mesh in orphan_meshes:
+            parent = mesh.metadata.path.rsplit("/", 1)[0]
+            orphan_parents[parent].append(mesh)
+
+        for parent, meshes in orphan_parents.items():
+            objectid_color = (0.5, 0.5, 0.5)
+            for m in meshes:
+                if m.metadata.objectid_color is not None:
+                    objectid_color = m.metadata.objectid_color
+                    break
+
+            paths = [m.metadata.path for m in meshes]
+            all_vertices = np.vstack([m.vertices_world for m in meshes])
+            bbox_min = all_vertices.min(axis=0)
+            bbox_max = all_vertices.max(axis=0)
+            body_measurements = compute_body_centric_measurements(all_vertices)
+
+            group_id = f"orphan_{group_counter:04d}"
+            short_name = parent.split("/")[-1]
+            unique_name = f"orphan_{short_name}"
+
+            total_verts = sum(m.metadata.vertex_count for m in meshes)
+            total_tris = sum(m.metadata.triangle_count for m in meshes)
+
+            group = DiageticGroupMetadata(
+                group_id=group_id,
+                unique_name=unique_name,
+                common_ancestor_path=parent,
+                objectid_color=objectid_color,
+                member_paths=tuple(paths),
+                member_count=len(meshes),
+                total_vertex_count=total_verts,
+                total_triangle_count=total_tris,
+                bbox_min=bbox_min.astype(np.float32),
+                bbox_max=bbox_max.astype(np.float32),
+                bounding_ellipsoid=body_measurements.bounding_ellipsoid,
+                path_danger=float("inf"),
+                category=GroupCategory.UNSAFE,
+            )
+
+            groups[group_id] = group
+            group_counter += 1
+
+    if show_progress:
+        print(f"  Created {len(groups)} diegetic groups", flush=True)
+
+    return groups
 
 
 # =============================================================================
@@ -1272,7 +1477,7 @@ def run_preprocessing_pipeline(
 
     Steps:
     1. Parse USD for diegetic metadata
-    2. Group diegetics by color and ancestor
+    2. Group diegetics by asset root (parent of 'geo' prim)
     3. Make group names unique
     4. Extract camera curve
     5. Compute path danger for all groups
@@ -1304,9 +1509,8 @@ def run_preprocessing_pipeline(
     if not metadata_list:
         raise RuntimeError("No diegetics found in USD stage")
 
-    # Step 2: Group by color and ancestor
-    groups = group_diagetics_by_color_and_ancestor(
-        stage=stage,
+    # Step 2: Group by asset root (parent of 'geo' prim)
+    groups = group_diagetics_by_asset_root(
         mesh_data_list=mesh_data_list,
         time_code=time_code,
         verbose=verbose,
