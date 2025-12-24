@@ -61,7 +61,8 @@ from ces26_utils import (
 # =============================================================================
 
 #USD_FILE = r"C:\Users\chorvath\Downloads\20251220_iv060_flat_02\Collected_20251220_iv060_flat_02\20251220_iv060_flat_02.usd"
-USD_FILE = r"C:\Users\chorvath\Downloads\20251221_iv060_flat_03\20251221_iv060_flat_03\20251221_iv060_flat_03.usd"
+#USD_FILE = r"C:\Users\chorvath\Downloads\20251221_iv060_flat_03\20251221_iv060_flat_03\20251221_iv060_flat_03.usd"
+USD_FILE = r"C:\Users\chorvath\Downloads\20251223_iv060_flat_04\Collected_20251223_iv060_flat_04\20251223_iv060_flat_04.usd"
 CAMERA_PATH = "/World/TD060"
 FRAMES = [2920, 3130]
 
