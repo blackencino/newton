@@ -1,20 +1,26 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 """
-Render semantic segmentation AOV using preprocessed cache metadata.
+Render all visible meshes in USD scene using the TD060 camera (v04).
 
-This script tests the preprocessing cache by:
-1. Loading metadata from the v04 preprocessed cache (no geometry)
-2. Using cached group info to know which USD paths to load and their semantic colors
-3. Loading geometry from USD for only those paths
-4. Rendering the semantic AOV for frames 2920 and 3130
+Uses the preprocessing cache with dynamic semantic coloring:
+1. Load preprocessing cache (metadata only, no geometry)
+2. Classify groups for dynamic per-frame coloring
+3. Load geometry from USD using cached metadata as filter
+4. Setup render context with headlight lighting
+5. Render all AOVs to EXR format, saving each AOV to a separate subdirectory
 
-The semantic color for each mesh is now determined by:
-- Group category (terrain/bg -> cool, unsafe -> hot, safe -> happy)
-- Distance from camera eye to group's bounding ellipsoid center
-- Normalized by the furthest group's distance at frame 2920
+EXR output (saved to subdirectories):
+- color/{base}_color.{frame:04d}.exr: Lit diffuse render (half-float RGB, [0, 1])
+- depth/{base}_depth.{frame:04d}.exr: Normalized depth (half-float Y, [0, 1], 0=near 1=far)
+- depth_heat/{base}_depth_heat.{frame:04d}.exr: Depth heat map (half-float RGB)
+- normal/{base}_normal.{frame:04d}.exr: Surface normals (half-float RGB, [0, 1] mapped from [-1, 1])
+- object_id/{base}_object_id.{frame:04d}.exr: Object ID colors from cache (half-float RGB)
+- semantic/{base}_semantic.{frame:04d}.exr: Semantic colors with distance-based gradients (half-float RGB)
 
-Usage: uv run python newton/examples/ces26/debug_semantic_v04.py
+Renders at 4K resolution (3840x2160), frames 2920-3130.
+
+Usage: uv run python newton/examples/ces26/render_td060_v04.py
 """
 
 from pathlib import Path
@@ -25,21 +31,29 @@ from pxr import Usd, UsdGeom
 
 from ces26_utils import (
     CameraData,
+    DepthColormap,
     Diegetic,
+    ExrOutputs,
     RenderConfig,
+    RenderOutputs,
+    ColorLUTs,
+    get_colormap_lut,
     get_camera_from_stage,
     make_diegetic_names_unique,
     open_usd_stage,
+    packed_uint32_to_float_rgb,
+    render_all_aovs,
+    save_exr_depth,
+    save_exr_rgb,
     setup_render_context,
     triangulate,
     transform_points_to_world,
 )
 from dynamic_segmentation import (
-    load_preprocessing_cache,
-    DiageticGroupMetadata,
-    DiageticMetadata,
     CameraCurve,
+    DiageticGroupMetadata,
     GroupCategory,
+    load_preprocessing_cache,
 )
 from dynamic_segmentation.gradients_b import (
     gradient_cool,
@@ -60,15 +74,18 @@ CACHE_FILE = CACHE_DIR / "preprocess_v2.npz"
 
 # Camera and frames
 CAMERA_PATH = "/World/TD060"
-FRAMES = [2920, 3130]
+FRAMES = list(range(2920, 3131))  # 2920 to 3130 inclusive
 
 # Output configuration
 OUTPUT_DIR = CACHE_DIR
+OUTPUT_FORMAT = "exr"
+DEPTH_COLORMAP = DepthColormap.MAGMA
+
 RENDER_CONFIG = RenderConfig(
     width=3840,
     height=2160,
-    output_dir=OUTPUT_DIR,
-    filename_pattern="semantic_gradient.{frame}.png",
+    output_dir=OUTPUT_DIR,  # Base directory, subdirs created per AOV
+    filename_pattern="frame.{frame}.exr",
 )
 
 # Distance thresholds for object classification
@@ -78,7 +95,7 @@ INERT_NORM_DIST = 100.0   # Normalization distance for inert objects (meters)
 
 
 # =============================================================================
-# Transform groups: assign colors by category + distance
+# Dynamic Category Classification
 # =============================================================================
 
 from dataclasses import dataclass
@@ -138,8 +155,9 @@ def compute_distance_colored_groups(
     frame_idx = frame_idx[0]
     camera_eye = camera_curve.positions[frame_idx]
     
-    print(f"  Camera eye at frame {reference_frame}: "
-          f"[{camera_eye[0]:.1f}, {camera_eye[1]:.1f}, {camera_eye[2]:.1f}]")
+    if verbose:
+        print(f"  Camera eye at frame {reference_frame}: "
+              f"[{camera_eye[0]:.1f}, {camera_eye[1]:.1f}, {camera_eye[2]:.1f}]")
     
     # Step 2: Classify all groups
     dynamic_groups: dict[str, DynamicCategory] = {}
@@ -164,9 +182,10 @@ def compute_distance_colored_groups(
                 dynamic_groups[group_id] = DynamicCategory.INERT
                 category_counts["inert"] += 1
     
-    print(f"  Classification: {category_counts['unsafe']} truly unsafe (path_danger <= {UNSAFE_MAX_DIST}m), "
-          f"{category_counts['safe']} truly safe (path_danger <= {SAFE_MAX_DIST}m), "
-          f"{category_counts['inert']} inert")
+    if verbose:
+        print(f"  Classification: {category_counts['unsafe']} truly unsafe (path_danger <= {UNSAFE_MAX_DIST}m), "
+              f"{category_counts['safe']} truly safe (path_danger <= {SAFE_MAX_DIST}m), "
+              f"{category_counts['inert']} inert")
     
     # Step 3: Create placeholder colors for all groups
     result: dict[str, DiageticGroupMetadata] = {}
@@ -204,16 +223,6 @@ def compute_distance_colored_groups(
             category=group.category,
         )
         result[group_id] = updated_group
-        
-        if verbose:
-            dyn_cat = dynamic_groups.get(group_id)
-            cat_str = dyn_cat.value if dyn_cat else "terrain"
-            print(f"  {group.unique_name}: {cat_str} -> placeholder color")
-    
-    # Report category counts
-    print(f"  Categories: terrain={category_counts['terrain']}, "
-          f"unsafe={category_counts['unsafe']}, safe={category_counts['safe']}, "
-          f"inert={category_counts['inert']}")
     
     return result, dynamic_groups
 
@@ -304,7 +313,7 @@ def update_dynamic_colors_for_frame(
         else:  # INERT
             norm_dist = INERT_NORM_DIST
             t = np.clip(distance / norm_dist, 0.0, 1.0)
-            color_rgb = gradient_cool(1.0 - t) # Reversed: closer = brighter
+            color_rgb = gradient_cool(1.0 - t)  # Reversed: closer = brighter
         
         packed_color = rgb_to_packed_uint32_bgr(
             float(color_rgb[0]), float(color_rgb[1]), float(color_rgb[2])
@@ -404,7 +413,7 @@ def load_diegetics_from_usd_with_cache(
         
         # Get the group for this mesh (for semantic color)
         group = path_to_group[path_str]
-        semantic_color = group.objectid_color
+        objectid_color = group.objectid_color
         
         # Extract geometry - handle instanced geometry
         if prim.IsInstanceProxy():
@@ -433,22 +442,24 @@ def load_diegetics_from_usd_with_cache(
         
         name = path_str.split("/")[-1]
         
-        # Create Diegetic with semantic color from group
+        # Create Diegetic with colors from group
+        # Use objectid_color for both object_id and semantic (semantic will be updated per-frame)
+        # Use a neutral gray for diffuse_albedo (will be lit by headlight)
         diegetic = Diegetic(
             name=name,
             path=path_str,
             vertices=vertices,
             faces=faces,
-            diffuse_albedo=semantic_color,
-            object_id=semantic_color,
-            semantic=semantic_color,
+            diffuse_albedo=(0.7, 0.7, 0.7),  # Neutral gray for headlight lighting
+            object_id=objectid_color,  # From cache
+            semantic=objectid_color,  # Placeholder, will be updated per-frame
         )
         
         diegetics.append(diegetic)
         
         if verbose:
             print(f"  LOADED: {path_str} -> group {group.unique_name} "
-                  f"(color=({semantic_color[0]:.2f}, {semantic_color[1]:.2f}, {semantic_color[2]:.2f}))")
+                  f"(objectid=({objectid_color[0]:.2f}, {objectid_color[1]:.2f}, {objectid_color[2]:.2f}))")
     
     if show_progress:
         print(f"  Done: {len(diegetics)} meshes loaded, {paths_skipped} skipped", flush=True)
@@ -457,7 +468,7 @@ def load_diegetics_from_usd_with_cache(
 
 
 # =============================================================================
-# Custom kernel with configurable background color
+# Custom Kernel for Background Color
 # =============================================================================
 
 @wp.kernel
@@ -478,78 +489,183 @@ def shape_index_to_color_lut_with_bg(
 
 
 # =============================================================================
-# Render semantic AOV only
+# Headlight Lighting
 # =============================================================================
 
-def render_semantic_aov(
-    ctx,
-    color_luts,
-    camera: CameraData,
+def update_lights_for_headlight(ctx, camera_forward: np.ndarray) -> None:
+    """
+    Update render context lights to use headlight pointing along camera forward.
+    
+    Shadows are disabled for headlight mode since a camera-following light
+    would create unnatural shadows that shift with camera movement.
+    
+    Args:
+        ctx: RenderContext to update
+        camera_forward: Camera forward direction (normalized)
+    """
+    ctx.lights_active = wp.array([True], dtype=wp.bool)
+    ctx.lights_type = wp.array([1], dtype=wp.int32)  # directional
+    ctx.lights_cast_shadow = wp.array([False], dtype=wp.bool)  # No shadows for headlight
+    ctx.lights_position = wp.array([[0.0, 0.0, 0.0]], dtype=wp.vec3f)
+    ctx.lights_orientation = wp.array([camera_forward.tolist()], dtype=wp.vec3f)
+
+
+# =============================================================================
+# Custom EXR Conversion with Dark Purple Background
+# =============================================================================
+
+def convert_aovs_to_exr_data_with_bg(
+    outputs: RenderOutputs,
+    color_luts: ColorLUTs,
     config: RenderConfig,
-    frame_num: int,
-    base_name: str,
-) -> None:
+    depth_colormap: str = DepthColormap.MAGMA,
+) -> ExrOutputs:
     """
-    Render only the semantic AOV and save as PNG.
+    Convert raw GPU render outputs to float32 arrays for OpenEXR saving.
     
-    This is a simplified version of render_and_save_all_aovs that only
-    outputs the semantic pass.
+    Uses gradient_cool(0) as background color for semantic and object_id passes.
+    This is a custom version of convert_aovs_to_exr_data that uses a custom background.
+    
+    Args:
+        outputs: Raw RenderOutputs from render_all_aovs
+        color_luts: ColorLUTs for object_id and semantic mapping
+        config: Render configuration (for dimensions)
+        depth_colormap: Colormap for depth_heat (DepthColormap.VIRIDIS or .MAGMA)
+        
+    Returns:
+        ExrOutputs with all passes as float32 arrays in [0, 1]
     """
-    from PIL import Image
+    import ces26_utils
     
-    from ces26_utils import (
-        transforms_and_rays_from_camera_data,
-        packed_uint32_to_rgb,
+    height, width = config.height, config.width
+    
+    # Color pass - convert packed uint32 to float RGB
+    color_rgb = packed_uint32_to_float_rgb(
+        outputs.color_image.numpy()[0, 0], height, width
     )
-    from newton._src.sensors.warp_raytrace import ClearData
     
-    # Use gradient_cool(0) as background color instead of gray
-    # Packed format is 0xAABBGGRR (blue in bits 16-23, red in bits 0-7)
+    # Compute depth range once (used by both depth passes)
+    depth_range = wp.array([1e10, 0.0], dtype=wp.float32)
+    wp.launch(
+        ces26_utils.find_depth_range,
+        outputs.depth_image.shape,
+        [outputs.depth_image, depth_range],
+    )
+    depth_range_np = depth_range.numpy()
+    min_depth, max_depth = depth_range_np[0], depth_range_np[1]
+    
+    # Depth pass - normalize to 0-1
+    depth_raw = outputs.depth_image.numpy()[0, 0].reshape(height, width)
+    valid_mask = depth_raw > 0
+    if valid_mask.any():
+        denom = max(max_depth - min_depth, 0.001)
+        # Normalize: 0=near, 1=far
+        depth = np.where(valid_mask, (depth_raw - min_depth) / denom, 1.0)
+    else:
+        depth = np.ones_like(depth_raw)
+    
+    # Depth heat pass - interpolated colormap for smooth gradients
+    colormap_lut = get_colormap_lut(depth_colormap)
+    depth_heat_rgb = wp.zeros((1, 1, width * height), dtype=wp.vec3f)
+    wp.launch(
+        ces26_utils.depth_to_colormap_float,
+        outputs.depth_image.shape,
+        [outputs.depth_image, min_depth, max_depth, colormap_lut, depth_heat_rgb],
+    )
+    depth_heat = depth_heat_rgb.numpy()[0, 0].reshape(height, width, 3)
+    
+    # Normal pass - map from [-1, 1] to [0, 1]
+    normal_raw = outputs.normal_image.numpy()[0, 0].reshape(height, width, 3)
+    normal = normal_raw * 0.5 + 0.5
+    
+    # Background color: gradient_cool(0) - dark purple
     bg_rgb = gradient_cool(0.0)
     bg_r = int(bg_rgb[0] * 255)
     bg_g = int(bg_rgb[1] * 255)
     bg_b = int(bg_rgb[2] * 255)
     bg_color_packed = 0xFF000000 | (bg_b << 16) | (bg_g << 8) | bg_r
     
-    print(f"Rendering frame {frame_num} (semantic AOV only)...")
-    
-    # Generate camera rays
-    camera_transforms, camera_rays = transforms_and_rays_from_camera_data(
-        camera, config.width, config.height
-    )
-    
-    # Create output arrays - we only need shape_index for semantic
-    shape_index_image = ctx.create_shape_index_image_output()
-    
-    # Render (we need shape indices to map to semantic colors)
-    ctx.render(
-        camera_transforms=camera_transforms,
-        camera_rays=camera_rays,
-        shape_index_image=shape_index_image,
-        refit_bvh=True,
-        clear_data=ClearData(clear_color=bg_color_packed),
-    )
-    
-    # Map shape indices to semantic colors using LUT with custom background
-    semantic_rgba = wp.zeros_like(shape_index_image)
+    # Object ID pass - use LUT on shape indices with custom background
+    object_id_rgba = wp.zeros_like(outputs.color_image)
     wp.launch(
         shape_index_to_color_lut_with_bg,
-        shape_index_image.shape,
-        [shape_index_image, color_luts.semantic, wp.uint32(bg_color_packed), semantic_rgba],
+        outputs.shape_index_image.shape,
+        [outputs.shape_index_image, color_luts.object_id, wp.uint32(bg_color_packed), object_id_rgba],
+    )
+    object_id_rgb = packed_uint32_to_float_rgb(
+        object_id_rgba.numpy()[0, 0], height, width
     )
     
-    # Convert to RGB
-    semantic_rgb = packed_uint32_to_rgb(
-        semantic_rgba.numpy()[0, 0], config.height, config.width
+    # Semantic pass - use LUT on shape indices with custom background
+    semantic_rgba = wp.zeros_like(outputs.color_image)
+    wp.launch(
+        shape_index_to_color_lut_with_bg,
+        outputs.shape_index_image.shape,
+        [outputs.shape_index_image, color_luts.semantic, wp.uint32(bg_color_packed), semantic_rgba],
+    )
+    semantic_rgb = packed_uint32_to_float_rgb(
+        semantic_rgba.numpy()[0, 0], height, width
     )
     
-    # Save
-    output_path = config.output_dir / f"{base_name}_semantic.{frame_num:04d}.png"
-    config.output_dir.mkdir(parents=True, exist_ok=True)
+    return ExrOutputs(
+        color=color_rgb.astype(np.float32),
+        depth=depth.astype(np.float32),
+        depth_heat=depth_heat.astype(np.float32),
+        normal=normal.astype(np.float32),
+        object_id=object_id_rgb.astype(np.float32),
+        semantic=semantic_rgb.astype(np.float32),
+    )
+
+
+# =============================================================================
+# Save AOVs to separate subdirectories
+# =============================================================================
+
+def save_all_aovs_exr_to_subdirs(
+    exr_outputs: ExrOutputs,
+    output_base_dir: Path,
+    frame_num: int,
+    base_name: str = "td060_v04",
+) -> None:
+    """
+    Save all AOV passes to disk as OpenEXR files in separate subdirectories.
     
-    img = Image.fromarray(semantic_rgb, mode="RGB")
-    img.save(output_path)
-    print(f"Saved: {output_path}")
+    Creates subdirectories for each AOV:
+    - color/{base_name}_color.{frame:04d}.exr
+    - depth/{base_name}_depth.{frame:04d}.exr
+    - depth_heat/{base_name}_depth_heat.{frame:04d}.exr
+    - normal/{base_name}_normal.{frame:04d}.exr
+    - object_id/{base_name}_object_id.{frame:04d}.exr
+    - semantic/{base_name}_semantic.{frame:04d}.exr
+    
+    Args:
+        exr_outputs: ExrOutputs from convert_aovs_to_exr_data
+        output_base_dir: Base directory (subdirectories created inside)
+        frame_num: Frame number for filename (formatted as 4-digit zero-padded)
+        base_name: Base filename (before the AOV suffix)
+    """
+    aov_subdirs = {
+        "color": "color",
+        "depth": "depth",
+        "depth_heat": "depth_heat",
+        "normal": "normal",
+        "object_id": "object_id",
+        "semantic": "semantic",
+    }
+    
+    for aov_name, subdir_name in aov_subdirs.items():
+        subdir = output_base_dir / subdir_name
+        subdir.mkdir(parents=True, exist_ok=True)
+        
+        filename = f"{base_name}_{aov_name}.{frame_num:04d}.exr"
+        output_path = subdir / filename
+        
+        if aov_name == "depth":
+            # Single-channel depth
+            save_exr_depth(getattr(exr_outputs, aov_name), output_path)
+        else:
+            # RGB channels
+            save_exr_rgb(getattr(exr_outputs, aov_name), output_path)
 
 
 # =============================================================================
@@ -558,11 +674,16 @@ def render_semantic_aov(
 
 def main():
     print("=" * 70)
-    print("Debug Semantic V04 - Distance-Based Gradient Colors")
+    print("Render TD060 V04 - Preprocessing Cache + Dynamic Semantic Colors")
     print("=" * 70)
-    print(f"  UNSAFE_MAX_DIST = {UNSAFE_MAX_DIST}m (unsafe threshold)")
-    print(f"  SAFE_MAX_DIST = {SAFE_MAX_DIST}m (safe threshold)")
-    print(f"  INERT_NORM_DIST = {INERT_NORM_DIST}m (normalization for inert objects)")
+    print(f"  USD file: {USD_FILE}")
+    print(f"  Cache file: {CACHE_FILE}")
+    print(f"  Output directory: {OUTPUT_DIR}")
+    print(f"  Frames: {FRAMES[0]} to {FRAMES[-1]} ({len(FRAMES)} frames)")
+    print(f"  Resolution: {RENDER_CONFIG.width}x{RENDER_CONFIG.height}")
+    print(f"  UNSAFE_MAX_DIST = {UNSAFE_MAX_DIST}m")
+    print(f"  SAFE_MAX_DIST = {SAFE_MAX_DIST}m")
+    print(f"  INERT_NORM_DIST = {INERT_NORM_DIST}m")
     
     # Step 1: Load preprocessing cache (metadata only, no geometry)
     print(f"\nStep 1: Loading preprocessing cache from {CACHE_FILE}")
@@ -628,16 +749,19 @@ def main():
     print(f"  Dynamic groups: {unsafe_count} unsafe, {safe_count} safe, {inert_count} inert")
     print(f"  Total dynamic shapes: {total_dynamic_shapes}")
     
-    # Step 7: Setup render context
-    print("\nStep 7: Setting up render context...")
+    # Step 7: Setup render context with headlight lighting
+    print("\nStep 7: Setting up render context with headlight lighting...")
     ctx, color_luts, _ = setup_render_context(diegetics, RENDER_CONFIG, lights=None)
     
-    # Step 8: Render semantic AOV for each frame
-    print(f"\nStep 8: Rendering semantic AOV for frames {FRAMES}...")
+    # Step 8: Render all AOVs for each frame
+    print(f"\nStep 8: Rendering all AOVs for frames {FRAMES[0]} to {FRAMES[-1]}...")
     
-    for frame in FRAMES:
+    for i, frame in enumerate(FRAMES):
         time_code = Usd.TimeCode(frame)
-        camera = get_camera_from_stage(stage, CAMERA_PATH, time_code, verbose=True)
+        camera = get_camera_from_stage(stage, CAMERA_PATH, time_code, verbose=False)
+        
+        # Update headlight direction to follow camera
+        update_lights_for_headlight(ctx, camera.forward)
         
         # Update ALL dynamic object colors based on distance at THIS frame
         if dynamic_infos:
@@ -647,17 +771,32 @@ def main():
                 camera_eye=camera.position,
             )
         
-        render_semantic_aov(
-            ctx=ctx,
-            color_luts=color_luts,
-            camera=camera,
-            config=RENDER_CONFIG,
+        # Single render pass
+        outputs = render_all_aovs(ctx, camera, RENDER_CONFIG)
+        
+        # Convert to EXR data (with custom dark purple background for semantic/object_id)
+        exr_outputs = convert_aovs_to_exr_data_with_bg(outputs, color_luts, RENDER_CONFIG, DEPTH_COLORMAP)
+        
+        # Save to separate subdirectories
+        save_all_aovs_exr_to_subdirs(
+            exr_outputs=exr_outputs,
+            output_base_dir=OUTPUT_DIR,
             frame_num=frame,
-            base_name="semantic_gradient",
+            base_name="td060_v04",
         )
+        
+        # Progress update
+        if (i + 1) % 10 == 0 or i == 0 or i == len(FRAMES) - 1:
+            print(f"Rendered frame {frame} ({i + 1}/{len(FRAMES)})")
     
     print("\n" + "=" * 70)
-    print("Done! Output saved to:", OUTPUT_DIR)
+    print("Done! Output saved to subdirectories in:", OUTPUT_DIR)
+    print("  - color/")
+    print("  - depth/")
+    print("  - depth_heat/")
+    print("  - normal/")
+    print("  - object_id/")
+    print("  - semantic/")
     print("=" * 70)
 
 

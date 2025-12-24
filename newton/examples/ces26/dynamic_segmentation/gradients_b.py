@@ -118,6 +118,8 @@ def gradient_cool(t: float | np.ndarray) -> np.ndarray:
     Returns:
         RGB color(s) as float32 in range 0-1
     """
+    # CJH HACK
+    t = (t ** 2.2) * 0.6
     return _interpolate_gradient(_GRADIENT_COOL, t)
 
 
