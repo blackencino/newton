@@ -72,6 +72,12 @@ OUTPUT_FORMAT = "png"  # or "exr"
 # Note: Only used for PNG output (depth_heat pass)
 DEPTH_COLORMAP = DepthColormap.MAGMA  # or DepthColormap.VIRIDIS
 
+# Lighting mode:
+#   "scene" - Use lights from USD scene (DistantLight + fill from DomeLight)
+#   "headlight" - Simple headlight (follows camera) + constant ambient
+#LIGHTING_MODE = "scene"  # or "headlight"
+LIGHTING_MODE = "headlight"
+
 RENDER_CONFIG = RenderConfig(
     width=3840,
     height=2160,
@@ -98,6 +104,57 @@ SEMANTIC_EXTRACTOR = random_color(seed=42)
 
 
 # =============================================================================
+# Headlight Helper
+# =============================================================================
+
+import numpy as np
+import warp as wp
+
+
+def create_headlight(camera_forward: np.ndarray) -> LightData:
+    """
+    Create a headlight that points in the camera's view direction.
+    
+    A headlight provides simple, consistent lighting for debugging.
+    It follows the camera so all surfaces facing the camera are lit.
+    Shadows are disabled since they would shift unnaturally with camera movement.
+    
+    Args:
+        camera_forward: Camera forward direction (normalized)
+        
+    Returns:
+        LightData for a directional light pointing along the camera view
+    """
+    return LightData(
+        path="/Headlight",
+        light_type=1,  # directional
+        position=np.array([0.0, 0.0, 0.0], dtype=np.float32),
+        direction=camera_forward.astype(np.float32),
+        color=(1.0, 1.0, 1.0),  # Neutral white
+        intensity=1.0,
+        cast_shadows=False,  # No shadows for headlight
+    )
+
+
+def update_lights_for_headlight(ctx, camera_forward: np.ndarray) -> None:
+    """
+    Update render context lights to use headlight pointing along camera forward.
+    
+    Shadows are disabled for headlight mode since a camera-following light
+    would create unnatural shadows that shift with camera movement.
+    
+    Args:
+        ctx: RenderContext to update
+        camera_forward: Camera forward direction (normalized)
+    """
+    ctx.lights_active = wp.array([True], dtype=wp.bool)
+    ctx.lights_type = wp.array([1], dtype=wp.int32)  # directional
+    ctx.lights_cast_shadow = wp.array([False], dtype=wp.bool)  # No shadows for headlight
+    ctx.lights_position = wp.array([[0.0, 0.0, 0.0]], dtype=wp.vec3f)
+    ctx.lights_orientation = wp.array([camera_forward.tolist()], dtype=wp.vec3f)
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -105,58 +162,70 @@ def main():
     stage = open_usd_stage(USD_FILE)
     time_code = Usd.TimeCode(FRAMES[0])
 
-    # Phase 1a: Find lights in the USD scene
-    # Filter to use only /Environment lights (skip duplicates in BarbieColors)
-    def environment_light_filter(path: str) -> bool:
-        return path.startswith("/Environment/")
+    # Lighting setup depends on mode
+    lights = None
+    use_headlight = (LIGHTING_MODE == "headlight")
     
-    lights = find_lights(
-        stage=stage,
-        time_code=time_code,
-        path_filter=environment_light_filter,
-        verbose=True,
-    )
-    print(f"Found {len(lights)} directional/positional lights from USD scene")
-    
-    # Phase 1a.2: Find ambient (DomeLight) and create a fill light
-    # Since the renderer has hardcoded ambient, we add a fill light to brighten shadows
-    ambient = find_ambient_light(
-        stage=stage,
-        time_code=time_code,
-        path_filter=environment_light_filter,
-        verbose=True,
-    )
-    
-    if ambient:
-        # Get key light direction if available
-        key_direction = lights[0].direction if lights else None
-        fill_light = create_fill_light_from_ambient(ambient, key_direction)
+    if use_headlight:
+        # Headlight mode: simple camera-following light + ambient
+        # Lights will be updated per-frame based on camera direction
+        print("Using HEADLIGHT mode (camera-following light + ambient)")
+        lights = None  # Will be set per-frame
+    else:
+        # Scene mode: use lights from USD
+        print("Using SCENE LIGHTING mode")
         
-        # Artistic decision: drop fill light by 2 stops (multiply by 0.25)
-        # The renderer treats all lights equally (no per-light intensity),
-        # so we bake the reduction into the color
-        fill_exposure_reduction = 0.25  # 2 stops down
-        dimmed_color = (
-            fill_light.color[0] * fill_exposure_reduction,
-            fill_light.color[1] * fill_exposure_reduction,
-            fill_light.color[2] * fill_exposure_reduction,
+        # Phase 1a: Find lights in the USD scene
+        # Filter to use only /Environment lights (skip duplicates in BarbieColors)
+        def environment_light_filter(path: str) -> bool:
+            return path.startswith("/Environment/")
+        
+        lights = find_lights(
+            stage=stage,
+            time_code=time_code,
+            path_filter=environment_light_filter,
+            verbose=True,
         )
-        # Create a new LightData with the dimmed color
-        from ces26_utils import LightData
-        fill_light = LightData(
-            path=fill_light.path,
-            light_type=fill_light.light_type,
-            position=fill_light.position,
-            direction=fill_light.direction,
-            color=dimmed_color,
-            intensity=fill_light.intensity,
-            cast_shadows=fill_light.cast_shadows,
+        print(f"Found {len(lights)} directional/positional lights from USD scene")
+        
+        # Phase 1a.2: Find ambient (DomeLight) and create a fill light
+        # Since the renderer has hardcoded ambient, we add a fill light to brighten shadows
+        ambient = find_ambient_light(
+            stage=stage,
+            time_code=time_code,
+            path_filter=environment_light_filter,
+            verbose=True,
         )
         
-        lights.append(fill_light)
-        print(f"Added fill light from DomeLight ({ambient.path})")
-        print(f"  Fill direction: [{fill_light.direction[0]:.3f}, {fill_light.direction[1]:.3f}, {fill_light.direction[2]:.3f}]")
-        print(f"  Fill color (after -2 stops): RGB({fill_light.color[0]:.3f}, {fill_light.color[1]:.3f}, {fill_light.color[2]:.3f})")
+        if ambient:
+            # Get key light direction if available
+            key_direction = lights[0].direction if lights else None
+            fill_light = create_fill_light_from_ambient(ambient, key_direction)
+            
+            # Artistic decision: drop fill light by 2 stops (multiply by 0.25)
+            # The renderer treats all lights equally (no per-light intensity),
+            # so we bake the reduction into the color
+            fill_exposure_reduction = 0.25  # 2 stops down
+            dimmed_color = (
+                fill_light.color[0] * fill_exposure_reduction,
+                fill_light.color[1] * fill_exposure_reduction,
+                fill_light.color[2] * fill_exposure_reduction,
+            )
+            # Create a new LightData with the dimmed color
+            fill_light = LightData(
+                path=fill_light.path,
+                light_type=fill_light.light_type,
+                position=fill_light.position,
+                direction=fill_light.direction,
+                color=dimmed_color,
+                intensity=fill_light.intensity,
+                cast_shadows=fill_light.cast_shadows,
+            )
+            
+            lights.append(fill_light)
+            print(f"Added fill light from DomeLight ({ambient.path})")
+            print(f"  Fill direction: [{fill_light.direction[0]:.3f}, {fill_light.direction[1]:.3f}, {fill_light.direction[2]:.3f}]")
+            print(f"  Fill color (after -2 stops): RGB({fill_light.color[0]:.3f}, {fill_light.color[1]:.3f}, {fill_light.color[2]:.3f})")
 
     # Phase 1b: Parse USD into Diegetics (geometry + all color channels)
     options = ParseOptions(
@@ -191,6 +260,11 @@ def main():
     for frame in FRAMES:
         time_code = Usd.TimeCode(frame)
         camera = get_camera_from_stage(stage, CAMERA_PATH, time_code, verbose=True)
+        
+        # In headlight mode, update light direction to follow camera each frame
+        if use_headlight:
+            update_lights_for_headlight(ctx, camera.forward)
+            print(f"  Headlight direction: [{camera.forward[0]:.3f}, {camera.forward[1]:.3f}, {camera.forward[2]:.3f}]")
         
         # Single render pass outputs all AOVs
         render_and_save_all_aovs(
