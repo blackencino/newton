@@ -71,12 +71,36 @@ RENDER_CONFIG = RenderConfig(
     filename_pattern="semantic_gradient.{frame}.png",
 )
 
+# Distance thresholds for object classification
+UNSAFE_MAX_DIST = 2.5    # Unsafe objects with path_danger > this are "inert" (meters)
+SAFE_MAX_DIST = 5.0      # Safe objects with path_danger > this are "inert" (meters)
+INERT_NORM_DIST = 100.0  # Normalization distance for inert objects (meters)
+
 
 # =============================================================================
 # Transform groups: assign colors by category + distance
 # =============================================================================
 
+from dataclasses import dataclass
+from enum import Enum
+
 RGB = tuple[float, float, float]
+
+
+class DynamicCategory(Enum):
+    """Category for dynamic per-frame color updates."""
+    UNSAFE = "unsafe"      # gradient_hot, normalize by UNSAFE_MAX_DIST
+    SAFE = "safe"          # gradient_happy, normalize by SAFE_MAX_DIST
+    INERT = "inert"        # gradient_cool, normalize by INERT_NORM_DIST
+
+
+@dataclass
+class DynamicGroupInfo:
+    """Information about a group requiring per-frame color updates."""
+    group_id: str
+    center_world: np.ndarray  # (3,) ellipsoid center in world space
+    shape_indices: list[int]  # Shape indices in the render context
+    dynamic_category: DynamicCategory  # Which gradient/normalization to use
 
 
 def compute_distance_colored_groups(
@@ -84,27 +108,28 @@ def compute_distance_colored_groups(
     camera_curve: CameraCurve,
     reference_frame: int = 2920,
     verbose: bool = False,
-) -> dict[str, DiageticGroupMetadata]:
+) -> tuple[dict[str, DiageticGroupMetadata], dict[str, DynamicCategory]]:
     """
-    Transform groups to use gradient-based colors determined by category and distance.
+    Transform groups and classify them for dynamic per-frame coloring.
     
-    For each group:
-    1. Get its category (GROUND_TERRAIN, UNSAFE, or SAFE)
-    2. Compute distance from camera eye (at reference_frame) to group's ellipsoid center
-    3. Normalize distance by the max distance across all groups
-    4. Use the normalized distance as t to sample the appropriate gradient:
-       - GROUND_TERRAIN -> gradient_cool (blues/purples)
-       - UNSAFE -> gradient_hot (reds/pinks)
-       - SAFE -> gradient_happy (greens/yellows)
+    Classification:
+    - GROUND_TERRAIN -> keep original objectid_color (static)
+    - UNSAFE with path_danger <= UNSAFE_MAX_DIST -> truly unsafe (dynamic, gradient_hot)
+    - UNSAFE with path_danger > UNSAFE_MAX_DIST -> inert (dynamic, gradient_cool)
+    - SAFE with path_danger <= SAFE_MAX_DIST -> truly safe (dynamic, gradient_happy)
+    - SAFE with path_danger > SAFE_MAX_DIST -> inert (dynamic, gradient_cool)
+    
+    All dynamic groups get placeholder colors here; actual colors are computed per-frame.
+    Gradients use (1-t) for reversed polarity (closer = brighter).
     
     Args:
         groups: Dictionary of DiageticGroupMetadata
         camera_curve: Pre-baked camera animation
-        reference_frame: Frame number to use for camera position (default 2920)
+        reference_frame: Frame number for initial classification
         verbose: Print detailed progress
         
     Returns:
-        New dictionary with groups having updated objectid_color based on gradients
+        Tuple of (groups dict with placeholder colors, dict mapping group_id to DynamicCategory)
     """
     # Step 1: Get camera eye position at reference frame
     frame_idx = np.where(camera_curve.frames == reference_frame)[0]
@@ -116,36 +141,51 @@ def compute_distance_colored_groups(
     print(f"  Camera eye at frame {reference_frame}: "
           f"[{camera_eye[0]:.1f}, {camera_eye[1]:.1f}, {camera_eye[2]:.1f}]")
     
-    # Step 2: Compute distance for each group
-    group_distances: dict[str, float] = {}
+    # Step 2: Classify all groups
+    dynamic_groups: dict[str, DynamicCategory] = {}
+    category_counts = {"terrain": 0, "unsafe": 0, "safe": 0, "inert": 0}
+    
     for group_id, group in groups.items():
-        center = group.bounding_ellipsoid.center_world
-        distance = float(np.linalg.norm(camera_eye - center))
-        group_distances[group_id] = distance
+        if group.category == GroupCategory.GROUND_TERRAIN:
+            # Terrain is static, no dynamic category
+            category_counts["terrain"] += 1
+        elif group.category == GroupCategory.UNSAFE:
+            if group.path_danger <= UNSAFE_MAX_DIST:
+                dynamic_groups[group_id] = DynamicCategory.UNSAFE
+                category_counts["unsafe"] += 1
+            else:
+                dynamic_groups[group_id] = DynamicCategory.INERT
+                category_counts["inert"] += 1
+        else:  # SAFE
+            if group.path_danger <= SAFE_MAX_DIST:
+                dynamic_groups[group_id] = DynamicCategory.SAFE
+                category_counts["safe"] += 1
+            else:
+                dynamic_groups[group_id] = DynamicCategory.INERT
+                category_counts["inert"] += 1
     
-    # Step 3: Find max distance for normalization
-    max_distance = max(group_distances.values())
-    print(f"  Max distance from camera: {max_distance:.1f}")
+    print(f"  Classification: {category_counts['unsafe']} truly unsafe (path_danger <= {UNSAFE_MAX_DIST}m), "
+          f"{category_counts['safe']} truly safe (path_danger <= {SAFE_MAX_DIST}m), "
+          f"{category_counts['inert']} inert")
     
-    # Step 4: Transform each group with gradient-based color
+    # Step 3: Create placeholder colors for all groups
     result: dict[str, DiageticGroupMetadata] = {}
-    category_counts: dict[GroupCategory, int] = {c: 0 for c in GroupCategory}
     
     for group_id, group in groups.items():
-        distance = group_distances[group_id]
-        t = np.clip(distance / max_distance, 0.0, 1.0)
-        
-        # Select gradient based on category
         if group.category == GroupCategory.GROUND_TERRAIN:
             # Keep original objectid_color for terrain/bg
             new_color = group.objectid_color
-        elif group.category == GroupCategory.UNSAFE:
-            color_rgb = gradient_hot(t)
+        else:
+            # All dynamic groups get a placeholder (will be updated per-frame)
+            # Use mid-gradient as placeholder
+            dyn_cat = dynamic_groups.get(group_id, DynamicCategory.INERT)
+            if dyn_cat == DynamicCategory.UNSAFE:
+                color_rgb = gradient_hot(0.5)
+            elif dyn_cat == DynamicCategory.SAFE:
+                color_rgb = gradient_happy(0.5)
+            else:  # INERT
+                color_rgb = gradient_cool(0.5)
             new_color = (float(color_rgb[0]), float(color_rgb[1]), float(color_rgb[2]))
-        else:  # SAFE
-            color_rgb = gradient_happy(t)
-            new_color = (float(color_rgb[0]), float(color_rgb[1]), float(color_rgb[2]))
-        category_counts[group.category] += 1
         
         # Create new group with updated color
         updated_group = DiageticGroupMetadata(
@@ -166,16 +206,116 @@ def compute_distance_colored_groups(
         result[group_id] = updated_group
         
         if verbose:
-            print(f"  {group.unique_name}: {group.category.value} @ dist={distance:.1f} "
-                  f"-> t={t:.3f} -> color=({new_color[0]:.2f}, {new_color[1]:.2f}, {new_color[2]:.2f})")
+            dyn_cat = dynamic_groups.get(group_id)
+            cat_str = dyn_cat.value if dyn_cat else "terrain"
+            print(f"  {group.unique_name}: {cat_str} -> placeholder color")
     
     # Report category counts
-    print(f"  Categories: "
-          f"terrain={category_counts[GroupCategory.GROUND_TERRAIN]}, "
-          f"unsafe={category_counts[GroupCategory.UNSAFE]}, "
-          f"safe={category_counts[GroupCategory.SAFE]}")
+    print(f"  Categories: terrain={category_counts['terrain']}, "
+          f"unsafe={category_counts['unsafe']}, safe={category_counts['safe']}, "
+          f"inert={category_counts['inert']}")
     
-    return result
+    return result, dynamic_groups
+
+
+def build_dynamic_group_infos(
+    dynamic_groups: dict[str, DynamicCategory],
+    groups: dict[str, DiageticGroupMetadata],
+    path_to_shape_index: dict[str, int],
+) -> list[DynamicGroupInfo]:
+    """
+    Build a list of DynamicGroupInfo for per-frame color updates.
+    
+    Args:
+        dynamic_groups: Dict mapping group_id to DynamicCategory
+        groups: Dictionary of DiageticGroupMetadata
+        path_to_shape_index: Mapping from mesh path to shape index
+        
+    Returns:
+        List of DynamicGroupInfo with shape indices and category for each dynamic group
+    """
+    dynamic_infos: list[DynamicGroupInfo] = []
+    
+    for group_id, dyn_category in dynamic_groups.items():
+        group = groups[group_id]
+        
+        # Find all shape indices for this group's member paths
+        shape_indices = []
+        for member_path in group.member_paths:
+            if member_path in path_to_shape_index:
+                shape_indices.append(path_to_shape_index[member_path])
+        
+        if shape_indices:
+            dynamic_infos.append(DynamicGroupInfo(
+                group_id=group_id,
+                center_world=group.bounding_ellipsoid.center_world.copy(),
+                shape_indices=shape_indices,
+                dynamic_category=dyn_category,
+            ))
+    
+    return dynamic_infos
+
+
+def rgb_to_packed_uint32_bgr(r: float, g: float, b: float) -> int:
+    """Convert RGB floats (0-1) to packed uint32 in 0xAABBGGRR format."""
+    return (
+        0xFF000000 |
+        (int(b * 255) << 16) |
+        (int(g * 255) << 8) |
+        int(r * 255)
+    )
+
+
+def update_dynamic_colors_for_frame(
+    semantic_lut: wp.array,
+    dynamic_infos: list[DynamicGroupInfo],
+    camera_eye: np.ndarray,
+) -> None:
+    """
+    Update the semantic LUT with per-frame colors for all dynamic objects.
+    
+    For each dynamic group:
+    1. Compute distance from camera_eye to group's ellipsoid center
+    2. Normalize by the appropriate distance (UNSAFE_MAX_DIST, SAFE_MAX_DIST, or INERT_NORM_DIST)
+    3. Use the appropriate gradient with reversed polarity (1-t) for closer=brighter
+    4. Update all shape indices belonging to this group
+    
+    Args:
+        semantic_lut: Warp array of packed uint32 colors (modified in-place)
+        dynamic_infos: List of DynamicGroupInfo with shape indices and category
+        camera_eye: Camera position at this frame (3,)
+    """
+    # Get LUT as numpy for modification
+    lut_np = semantic_lut.numpy()
+    
+    for info in dynamic_infos:
+        # Compute distance from camera to group center
+        distance = float(np.linalg.norm(camera_eye - info.center_world))
+        
+        # Select normalization distance and gradient based on category
+        if info.dynamic_category == DynamicCategory.UNSAFE:
+            norm_dist = UNSAFE_MAX_DIST
+            t = np.clip(distance / norm_dist, 0.0, 1.0)
+            color_rgb = gradient_hot(1.0 - t)  # Reversed: closer = brighter (higher t)
+        elif info.dynamic_category == DynamicCategory.SAFE:
+            norm_dist = SAFE_MAX_DIST
+            t = np.clip(distance / norm_dist, 0.0, 1.0)
+            color_rgb = gradient_happy(1.0 - t)  # Reversed: closer = brighter
+        else:  # INERT
+            norm_dist = INERT_NORM_DIST
+            t = np.clip(distance / norm_dist, 0.0, 1.0)
+            color_rgb = gradient_cool(1.0 - t)  # Reversed: closer = brighter
+        
+        packed_color = rgb_to_packed_uint32_bgr(
+            float(color_rgb[0]), float(color_rgb[1]), float(color_rgb[2])
+        )
+        
+        # Update all shape indices for this group
+        for shape_idx in info.shape_indices:
+            lut_np[shape_idx] = packed_color
+    
+    # Copy back to GPU
+    semantic_lut.assign(lut_np)
 
 
 # =============================================================================
@@ -420,6 +560,9 @@ def main():
     print("=" * 70)
     print("Debug Semantic V04 - Distance-Based Gradient Colors")
     print("=" * 70)
+    print(f"  UNSAFE_MAX_DIST = {UNSAFE_MAX_DIST}m (unsafe threshold)")
+    print(f"  SAFE_MAX_DIST = {SAFE_MAX_DIST}m (safe threshold)")
+    print(f"  INERT_NORM_DIST = {INERT_NORM_DIST}m (normalization for inert objects)")
     
     # Step 1: Load preprocessing cache (metadata only, no geometry)
     print(f"\nStep 1: Loading preprocessing cache from {CACHE_FILE}")
@@ -430,16 +573,16 @@ def main():
     print(f"  Camera path: {camera_curve.camera_path}")
     print(f"  Camera frames: {camera_curve.frames[0]} to {camera_curve.frames[-1]}")
     
-    # Step 2: Transform groups to use gradient-based colors
-    print("\nStep 2: Computing distance-based gradient colors...")
-    groups = compute_distance_colored_groups(
+    # Step 2: Classify groups for dynamic coloring
+    print("\nStep 2: Classifying groups for dynamic coloring...")
+    groups, dynamic_groups = compute_distance_colored_groups(
         groups=groups,
         camera_curve=camera_curve,
-        reference_frame=FRAMES[0],  # Use frame 2920 for normalization
+        reference_frame=FRAMES[0],
         verbose=False,
     )
     
-    # Step 3: Build path-to-group mapping (with new colors)
+    # Step 3: Build path-to-group mapping (with placeholder colors)
     print("\nStep 3: Building path-to-group mapping...")
     path_to_group = build_path_to_group_map(groups)
     print(f"  Mapped {len(path_to_group)} mesh paths to groups")
@@ -467,16 +610,42 @@ def main():
     diegetics = make_diegetic_names_unique(diegetics)
     print(f"  Final: {len(diegetics)} diegetics ready for rendering")
     
-    # Step 6: Setup render context
-    print("\nStep 6: Setting up render context...")
+    # Step 6: Build path-to-shape-index mapping for dynamic object updates
+    print("\nStep 6: Building path-to-shape-index mapping...")
+    path_to_shape_index: dict[str, int] = {}
+    for shape_idx, d in enumerate(diegetics):
+        path_to_shape_index[d.path] = shape_idx
+    print(f"  Mapped {len(path_to_shape_index)} paths to shape indices")
+    
+    # Build dynamic group info for per-frame updates
+    dynamic_infos = build_dynamic_group_infos(dynamic_groups, groups, path_to_shape_index)
+    
+    # Count by category
+    unsafe_count = sum(1 for i in dynamic_infos if i.dynamic_category == DynamicCategory.UNSAFE)
+    safe_count = sum(1 for i in dynamic_infos if i.dynamic_category == DynamicCategory.SAFE)
+    inert_count = sum(1 for i in dynamic_infos if i.dynamic_category == DynamicCategory.INERT)
+    total_dynamic_shapes = sum(len(info.shape_indices) for info in dynamic_infos)
+    print(f"  Dynamic groups: {unsafe_count} unsafe, {safe_count} safe, {inert_count} inert")
+    print(f"  Total dynamic shapes: {total_dynamic_shapes}")
+    
+    # Step 7: Setup render context
+    print("\nStep 7: Setting up render context...")
     ctx, color_luts, _ = setup_render_context(diegetics, RENDER_CONFIG, lights=None)
     
-    # Step 7: Render semantic AOV for each frame
-    print(f"\nStep 7: Rendering semantic AOV for frames {FRAMES}...")
+    # Step 8: Render semantic AOV for each frame
+    print(f"\nStep 8: Rendering semantic AOV for frames {FRAMES}...")
     
     for frame in FRAMES:
         time_code = Usd.TimeCode(frame)
         camera = get_camera_from_stage(stage, CAMERA_PATH, time_code, verbose=True)
+        
+        # Update ALL dynamic object colors based on distance at THIS frame
+        if dynamic_infos:
+            update_dynamic_colors_for_frame(
+                semantic_lut=color_luts.semantic,
+                dynamic_infos=dynamic_infos,
+                camera_eye=camera.position,
+            )
         
         render_semantic_aov(
             ctx=ctx,
