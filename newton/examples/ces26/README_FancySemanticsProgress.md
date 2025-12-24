@@ -107,15 +107,25 @@ regardless of how many sub-meshes it contains.
 **UNSAFE:** Everything else (default)
 
 ### Excluded Paths:
+- Anything not under `/World/` - non-scene content (look-dev, materials, utilities)
 - `/World/PaintTool/*` - Point instancer scatter (not renderable)
 - `/World/Sphere` - Debug geometry
 
 ### Current Test Results (V2):
-- 2442 diegetics parsed (excluding 7 orphans)
-- 132 asset groups created (by hierarchy)
+- 2435 diegetics parsed
+- 131 asset groups created (by hierarchy)
 - 26 SAFE groups (all lanterns/chains correctly identified)
 - 1 GROUND_TERRAIN group (Terrain_01 with 3 meshes)
-- 105 UNSAFE groups (props, crates, structures)
+- 104 UNSAFE groups (props, crates, structures)
+
+### Validation: objectid_color Consistency ✓
+
+Verified that all meshes within each group share the same `objectid_color`:
+- **131/131 groups** have uniform objectid_color values
+- Zero groups have mixed colors
+
+This confirms the hierarchy-based grouping doesn't accidentally combine meshes with
+different artist-assigned colors.
 
 ### Resolved Issues:
 
@@ -191,6 +201,35 @@ uv run python dump_hierarchy.py
 
 ### Cache Files:
 - `D:\ces26_data\td060\v04\preprocess_v2.npz` - Latest preprocessing cache (65 KB)
+
+---
+
+## Abandoned Approaches
+
+These approaches were implemented and tested but abandoned in favor of simpler solutions.
+
+### Color-Based Grouping (Removed 2025-12-23)
+
+**Original approach:** Group meshes by `(objectid_color, colored_root_ancestor)` - meshes
+with the same color AND a common ancestor with that color would be grouped together.
+
+**Functions removed:**
+- `group_diagetics_by_color_and_ancestor()` - Main grouping function
+- `_find_colored_root_for_mesh()` - Walk up hierarchy to find colored ancestor
+- `_get_objectid_color_at_path()` - Check color at a specific prim path
+- `_colors_match()` - Compare colors with tolerance
+- `_color_to_key()` - Convert color to hashable string
+
+**Why abandoned:**
+1. The `objectid_color` primvar is NOT unique per semantic object - many different 
+   assets share the same color (e.g., `StarWarsSet_01` and `HangingLanternA_03` both
+   have RGB(0.184, 0.153, 0.604))
+2. Required traversing the USD hierarchy to check ancestor colors, which is slow
+3. The flattened USD already has a clean hierarchy pattern (`/World/{Asset}/geo/`)
+   that makes hierarchy-based grouping trivial and fast
+
+**Better solution:** `group_diagetics_by_asset_root()` - simply use the parent of the
+`geo` prim as the asset root. This is fast (no USD queries) and semantically correct.
 
 ---
 
