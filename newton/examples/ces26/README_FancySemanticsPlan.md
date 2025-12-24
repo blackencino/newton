@@ -45,8 +45,8 @@ pt_screen = screen_T_camera @ camera_T_world @ world_T_object @ pt_object
 We need some utils before we even get started. These should go into the file: 
 `dynamic_segmentation/utils.py`. 
 
-1. USD transformations (row-vector, `Vnew = Vold * M`) into craig notation col vectors,
-`Vnew = M * Vold`
+1. USD transformations (row-vector, `Vnew = Vold @ M`) into craig notation col vectors,
+`Vnew = M @ Vold`
 
 2. Body-centric measurements
 Given a set of vertices created by concatenating together all the verts from multiple 

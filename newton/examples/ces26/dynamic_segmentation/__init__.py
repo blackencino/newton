@@ -12,12 +12,14 @@ This package provides tools for:
 """
 
 from .preprocess import (
+    CachedGeometry,
     CameraCurve,
     DiageticGroupMetadata,
     DiageticMetadata,
     GroupCategory,
     extract_camera_curve,
     group_diagetics_by_color_and_ancestor,
+    load_geometry_from_cache,
     load_preprocessing_cache,
     parse_diagetic_metadata,
     run_preprocessing_pipeline,
@@ -49,12 +51,14 @@ __all__ = [
     "usd_to_craig_3x3",
     "usd_to_craig_4x4",
     # Preprocess
+    "CachedGeometry",
     "CameraCurve",
     "DiageticGroupMetadata",
     "DiageticMetadata",
     "GroupCategory",
     "extract_camera_curve",
     "group_diagetics_by_color_and_ancestor",
+    "load_geometry_from_cache",
     "load_preprocessing_cache",
     "parse_diagetic_metadata",
     "run_preprocessing_pipeline",

@@ -109,6 +109,48 @@ Note: `SimGravelLrg_01` is a point simulation cache and doesn't render in this p
 3. **Tests are slow**: The test script parses the real 12GB USD file and takes ~30s.
    Consider caching the preprocessing results to disk for faster iteration.
 
+---
+
+## Cache Size Test Results (2025-12-24)
+
+Tested saving preprocessing data to `D:\ces26_data\td060\v04\`:
+
+### Geometry Statistics:
+- **36,093,730 vertices** (36M)
+- **70,301,071 triangles** (70M) 
+- **Estimated uncompressed: 1.19 GB**
+
+### Cache File Sizes:
+| Cache Type | Size | Save Time | Notes |
+|------------|------|-----------|-------|
+| Metadata-only | **60 KB** | instant | Perfect for fast iteration |
+| With geometry | **633 MB** | **252s** | Too slow, not practical |
+
+### Verdict: **Do NOT store geometry in cache**
+
+The 4+ minute save time makes this impractical. Parsing the USD (67s) is faster than 
+saving/loading the geometry cache. The metadata-only cache (60 KB) is sufficient for
+most preprocessing needs.
+
+### Grouping Analysis:
+
+The `StarWarsSet_01_0` group (categorized as GROUND_TERRAIN) contains:
+- **444 total meshes**, but only **3 are terrain**
+- Breakdown: 155 tents, 7 cloth, 7 pottery, 2 crates, 270 other
+- All share `objectid_color` RGB(0.184, 0.153, 0.604)
+- This same color is also used by `HangingLanternA_03`!
+
+The `objectid_color` primvar isn't unique per semantic object - many different asset
+types share the same color. The grouping is correct per the plan (color + ancestor),
+but semantic meaning must come from path analysis within groups.
+
+### Path Danger Analysis:
+
+Camera passes through **11 group ellipsoids** during the shot:
+- Expected for a camera moving through a detailed set
+- Largest: `Sphere` group with -421 path danger (camera very deep inside)
+- This is normal behavior for interior shots
+
 ### To Continue This Work:
 
 ```bash
@@ -121,8 +163,11 @@ uv run python -m dynamic_segmentation.test_utils
 # Run preprocessing test on real USD (slow, ~30s)
 uv run python -m dynamic_segmentation.test_preprocess
 
-# Run full preprocessing pipeline and save cache
-uv run python run_preprocessing.py
+# Run full preprocessing and test save/load
+uv run python run_preprocess_test.py
+
+# Examine groups and cache contents
+uv run python run_preprocess_test2.py
 ```
 
 ---

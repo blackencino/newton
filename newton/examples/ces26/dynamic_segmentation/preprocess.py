@@ -1065,7 +1065,9 @@ def load_preprocessing_cache(
     verbose: bool = False,
 ) -> tuple[list[DiageticMetadata], dict[str, DiageticGroupMetadata], CameraCurve]:
     """
-    Load preprocessing results from NPZ file.
+    Load preprocessing results from NPZ file (metadata only, no geometry).
+
+    For geometry, use load_geometry_from_cache() separately.
 
     Args:
         input_path: Path to the NPZ file
@@ -1167,6 +1169,88 @@ def load_preprocessing_cache(
     )
 
     return metadata_list, groups, camera_curve
+
+
+@dataclass(frozen=True)
+class CachedGeometry:
+    """
+    Container for geometry loaded from a preprocessing cache.
+
+    NOTE: Storing geometry in the cache is NOT recommended for large scenes.
+    For IV060, the geometry cache is 633 MB and takes 4+ minutes to save.
+    Re-parsing the USD (67s) is faster than using the geometry cache.
+
+    Attributes:
+        vertices: Concatenated world-space vertices (N, 3) float32
+        vertex_offsets: Per-mesh vertex offsets (M+1,) int32
+        faces: Concatenated face indices (F, 3) int32, already offset
+        face_offsets: Per-mesh face offsets (M+1,) int32
+        mesh_count: Number of meshes
+    """
+
+    vertices: np.ndarray
+    vertex_offsets: np.ndarray
+    faces: np.ndarray
+    face_offsets: np.ndarray
+    mesh_count: int
+
+    def get_mesh_vertices(self, mesh_idx: int) -> np.ndarray:
+        """Get vertices for a specific mesh."""
+        start = self.vertex_offsets[mesh_idx]
+        end = self.vertex_offsets[mesh_idx + 1]
+        return self.vertices[start:end]
+
+    def get_mesh_faces(self, mesh_idx: int) -> np.ndarray:
+        """Get face indices for a specific mesh (local indices, need to subtract vertex offset)."""
+        v_offset = self.vertex_offsets[mesh_idx]
+        f_start = self.face_offsets[mesh_idx]
+        f_end = self.face_offsets[mesh_idx + 1]
+        # Faces were stored with global offsets, convert back to local
+        faces = self.faces[f_start:f_end]
+        return faces - v_offset
+
+
+def load_geometry_from_cache(input_path: Path) -> CachedGeometry | None:
+    """
+    Load geometry from a preprocessing cache that includes mesh data.
+
+    WARNING: This can be very slow and memory-intensive for large scenes.
+    For IV060 (36M vertices, 70M triangles), this loads ~1.2 GB into memory.
+
+    Args:
+        input_path: Path to the NPZ file with geometry
+
+    Returns:
+        CachedGeometry if geometry is present, None otherwise
+    """
+    print(f"Loading geometry from {input_path}...", flush=True)
+
+    data = np.load(input_path, allow_pickle=True)
+
+    if "mesh_vertices" not in data.files:
+        print("  No geometry found in cache", flush=True)
+        return None
+
+    vertices = data["mesh_vertices"]
+    vertex_offsets = data["mesh_vertex_offsets"]
+    faces = data["mesh_faces"].reshape(-1, 3)  # Ensure (F, 3) shape
+    face_offsets = data["mesh_face_offsets"]
+
+    mesh_count = len(vertex_offsets) - 1
+
+    print(
+        f"  Loaded {len(vertices):,} vertices, {len(faces):,} triangles, "
+        f"{mesh_count} meshes",
+        flush=True,
+    )
+
+    return CachedGeometry(
+        vertices=vertices,
+        vertex_offsets=vertex_offsets,
+        faces=faces,
+        face_offsets=face_offsets,
+        mesh_count=mesh_count,
+    )
 
 
 # =============================================================================
