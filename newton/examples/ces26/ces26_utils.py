@@ -101,6 +101,7 @@ class ExrOutputs:
     All color arrays are (height, width, 3) float32.
     Depth is (height, width) float32, normalized to [0, 1].
     Normal is (height, width, 3) float32, mapped to [0, 1] from [-1, 1].
+    Shape index is (height, width) float32, raw integer indices stored as floats.
     """
     color: np.ndarray       # Lit diffuse render, float32 RGB in [0, 1]
     depth: np.ndarray       # Normalized depth values, float32 in [0, 1] (0=near, 1=far)
@@ -108,6 +109,7 @@ class ExrOutputs:
     normal: np.ndarray      # Surface normals mapped to [0, 1], float32
     object_id: np.ndarray   # Object ID colors, float32 RGB in [0, 1]
     semantic: np.ndarray    # Semantic colors, float32 RGB in [0, 1]
+    shape_index: np.ndarray # Raw shape index integers as float32, (height, width)
 
 
 # =============================================================================
@@ -543,6 +545,7 @@ class ParseOptions:
     path_filter: Callable[[str], bool] | None = None
     skip_invisible: bool = True
     skip_proxy: bool = True
+    require_render_purpose: bool = True  # Only include prims with purpose="render"
 
 
 # =============================================================================
@@ -1300,19 +1303,58 @@ def extract_geometry(
 
 
 def is_visible_mesh(prim: Usd.Prim, time_code: Usd.TimeCode) -> bool:
-    """Check if a prim is a visible mesh (not invisible for rendering)."""
+    """
+    Check if a prim is a visible mesh (not invisible for rendering).
+    
+    For instance proxies, we check visibility on the proxy itself (which is
+    in the scene hierarchy and inherits visibility from ancestors), NOT on
+    the prototype prim. The prototype doesn't have scene hierarchy visibility.
+    """
     if not prim.IsA(UsdGeom.Mesh):
         return False
     
-    # Get geometry prim for visibility check
-    if prim.IsInstanceProxy():
-        geom_prim = prim.GetPrimInPrototype()
-    else:
-        geom_prim = prim
-    
-    mesh = UsdGeom.Mesh(geom_prim)
+    # Check visibility on the prim in the scene hierarchy (proxy, not prototype)
+    # Instance proxies inherit visibility from their scene-graph ancestors
+    mesh = UsdGeom.Mesh(prim)
     visibility = mesh.ComputeEffectiveVisibility(UsdGeom.Tokens.render, time_code)
     return visibility != UsdGeom.Tokens.invisible
+
+
+def has_render_purpose(prim: Usd.Prim) -> bool:
+    """
+    Check if a prim has 'render' purpose.
+    
+    USD purpose values:
+    - 'default': No special purpose, included in all rendering paths
+    - 'render': Final quality data for high-quality/offline rendering
+    - 'proxy': Lightweight representation for interactive viewports
+    - 'guide': Visual aids like rig controllers, not for rendering
+    
+    This function returns True only for 'render' purpose, which represents
+    the final quality geometry intended for offline rendering.
+    
+    For instance proxies, we check purpose on the proxy itself (which is
+    in the scene hierarchy and inherits purpose from ancestors), NOT on
+    the prototype prim. Purpose is inherited from scene-graph ancestors.
+    
+    Args:
+        prim: The USD prim to check
+        
+    Returns:
+        True if the prim's computed purpose is 'render'
+    """
+    # Check purpose on the prim in the scene hierarchy (proxy, not prototype)
+    # Instance proxies inherit purpose from their scene-graph ancestors
+    imageable = UsdGeom.Imageable(prim)
+    if not imageable:
+        return False
+    
+    # ComputePurpose() returns a TfToken with the computed purpose,
+    # considering inheritance from ancestors
+    purpose = imageable.ComputePurpose()
+    
+    # We want only 'render' purpose
+    return purpose == UsdGeom.Tokens.render
 
 
 # =============================================================================
@@ -1338,6 +1380,13 @@ def parse_diegetics(
     - Three color extractors (one per color channel)
     
     Over the USD stage to produce immutable Diegetics.
+    
+    Filtering (controlled by ParseOptions):
+    - skip_invisible: Exclude prims with visibility="invisible"
+    - require_render_purpose: Only include prims with purpose="render"
+      (excludes "default", "proxy", and "guide" purpose prims)
+    - skip_proxy: Exclude prims with "/proxy/" in their path
+    - path_filter: Custom filter function for prim paths
     
     Args:
         stage: Opened USD stage
@@ -1387,10 +1436,17 @@ def parse_diegetics(
             prims_skipped += 1
             continue
         
-        # Filter: proxy geometry
+        # Filter: purpose (only include 'render' purpose geometry)
+        if options.require_render_purpose and not has_render_purpose(prim):
+            if verbose:
+                print(f"  SKIP (not render purpose): {path_str}")
+            prims_skipped += 1
+            continue
+        
+        # Filter: proxy geometry (path-based heuristic, separate from purpose)
         if options.skip_proxy and is_proxy_path(path_str):
             if verbose:
-                print(f"  SKIP (proxy): {path_str}")
+                print(f"  SKIP (proxy path): {path_str}")
             prims_skipped += 1
             continue
         
@@ -1748,6 +1804,28 @@ def setup_render_context(
     return ctx, color_luts, warp_meshes
 
 
+def update_lights_for_headlight(ctx: RenderContext, camera_forward: np.ndarray) -> None:
+    """
+    Update render context lights to use headlight pointing along camera forward.
+    
+    A "headlight" is a light attached to the camera that always points in the
+    direction the camera is looking. This provides uniform illumination of
+    visible surfaces without the complexity of scene lighting.
+    
+    Shadows are disabled for headlight mode since a camera-following light
+    would create unnatural shadows that shift with camera movement.
+    
+    Args:
+        ctx: RenderContext to update
+        camera_forward: Camera forward direction (normalized)
+    """
+    ctx.lights_active = wp.array([True], dtype=wp.bool)
+    ctx.lights_type = wp.array([1], dtype=wp.int32)  # directional
+    ctx.lights_cast_shadow = wp.array([False], dtype=wp.bool)  # No shadows for headlight
+    ctx.lights_position = wp.array([[0.0, 0.0, 0.0]], dtype=wp.vec3f)
+    ctx.lights_orientation = wp.array([camera_forward.tolist()], dtype=wp.vec3f)
+
+
 def render_all_aovs(
     ctx: RenderContext,
     camera: CameraData,
@@ -2050,6 +2128,15 @@ def convert_aovs_to_exr_data(
         semantic_rgba.numpy()[0, 0], height, width
     )
     
+    # Shape index pass - raw integer indices as float32 for EXR compatibility
+    # Background pixels have shape_index = 0xFFFFFFFF, we map to -1.0 for clarity
+    shape_index_raw = outputs.shape_index_image.numpy()[0, 0].reshape(height, width)
+    shape_index = np.where(
+        shape_index_raw == 0xFFFFFFFF,
+        -1.0,
+        shape_index_raw.astype(np.float32)
+    )
+    
     return ExrOutputs(
         color=color_rgb.astype(np.float32),
         depth=depth.astype(np.float32),
@@ -2057,6 +2144,7 @@ def convert_aovs_to_exr_data(
         normal=normal.astype(np.float32),
         object_id=object_id_rgb.astype(np.float32),
         semantic=semantic_rgb.astype(np.float32),
+        shape_index=shape_index.astype(np.float32),
     )
 
 
@@ -2116,6 +2204,75 @@ def save_exr_depth(depth: np.ndarray, output_path: Path) -> None:
     exr_file.write(str(output_path))
     
     print(f"Saved: {output_path}")
+
+
+def save_exr_shape_index(shape_index: np.ndarray, output_path: Path) -> None:
+    """
+    Save single-channel shape index to OpenEXR file with full float32 precision.
+    
+    Uses float32 instead of float16 to preserve integer precision for shape indices.
+    Background pixels are stored as -1.0.
+    
+    Args:
+        shape_index: (height, width) float32 array containing shape indices
+        output_path: Path to save the EXR file
+    """
+    if not _OPENEXR_AVAILABLE:
+        raise ImportError("OpenEXR package required for EXR output. Install with: uv pip install openexr")
+    
+    # Keep as float32 to preserve integer precision (float32 can exactly represent
+    # integers up to 2^24 = 16 million, more than enough for shape indices)
+    float_shape_index = shape_index.astype(np.float32)
+    
+    # Single Y channel for shape index
+    channels = {"Y": float_shape_index.copy()}
+    
+    # Create file with default compression and write
+    header = {"compression": OpenEXR.ZIP_COMPRESSION, "type": OpenEXR.scanlineimage}
+    exr_file = OpenEXR.File(header, channels)
+    exr_file.write(str(output_path))
+    
+    print(f"Saved: {output_path}")
+
+
+def save_shape_index_mapping(
+    diegetics: list,
+    output_path: Path,
+) -> None:
+    """
+    Save a JSON mapping from shape index to prim path.
+    
+    This mapping allows looking up which prim corresponds to a given shape index
+    in the shape_index EXR output. Useful for debugging and identifying geometry.
+    
+    Background pixels have shape_index = -1 (not in mapping).
+    
+    Args:
+        diegetics: List of Diegetic objects (order defines shape indices)
+        output_path: Path to save the JSON file
+    """
+    import json
+    
+    mapping = {
+        str(i): {
+            "path": d.path,
+            "name": d.name,
+        }
+        for i, d in enumerate(diegetics)
+    }
+    
+    # Add metadata
+    output = {
+        "description": "Shape index to prim path mapping for shape_index AOV",
+        "note": "Background pixels have shape_index = -1 (not in mapping)",
+        "num_shapes": len(diegetics),
+        "shapes": mapping,
+    }
+    
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(output, f, indent=2)
+    
+    print(f"Saved shape index mapping: {output_path}")
 
 
 def save_all_aovs_exr(

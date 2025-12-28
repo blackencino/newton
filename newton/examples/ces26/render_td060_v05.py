@@ -6,7 +6,9 @@ Render all visible meshes in USD scene using the TD060 camera (v05).
 Uses the Diegetic functional pipeline from ces26_utils with multi-AOV output:
 1. parse_diegetics: Folds geometry + color extractors over USD stage
 2. setup_render_context: Converts Diegetics to GPU-ready structures + ColorLUTs
-3. render_all_aovs: Single render pass outputs all AOVs
+3. render_all_aovs: Single render pass outputs all AOVs (with headlight, no shadows)
+
+Lighting: Headlight mode (directional light follows camera forward, no shadows).
 
 EXR output saved to subdirectories (D:\\ces26_data\\td060\\v05\\):
 - color/td060_v05_color.{frame:04d}.exr: Lit diffuse render (half-float RGB)
@@ -15,6 +17,8 @@ EXR output saved to subdirectories (D:\\ces26_data\\td060\\v05\\):
 - normal/td060_v05_normal.{frame:04d}.exr: Surface normals (half-float RGB)
 - object_id/td060_v05_object_id.{frame:04d}.exr: Object ID colors (half-float RGB)
 - semantic/td060_v05_semantic.{frame:04d}.exr: Semantic colors (half-float RGB)
+- shape_index/td060_v05_shape_index.{frame:04d}.exr: Raw shape index (float32 Y)
+- shape_index_mapping.json: Maps shape index to prim path (saved once)
 
 Renders at 4K resolution (3840x2160), frames 2920-3130.
 
@@ -42,7 +46,10 @@ from ces26_utils import (
     render_all_aovs,
     save_exr_depth,
     save_exr_rgb,
+    save_exr_shape_index,
+    save_shape_index_mapping,
     setup_render_context,
+    update_lights_for_headlight,
 )
 
 # =============================================================================
@@ -104,6 +111,7 @@ def save_all_aovs_exr_to_subdirs(
     - normal/{base_name}_normal.{frame:04d}.exr
     - object_id/{base_name}_object_id.{frame:04d}.exr
     - semantic/{base_name}_semantic.{frame:04d}.exr
+    - shape_index/{base_name}_shape_index.{frame:04d}.exr
     
     Args:
         exr_outputs: ExrOutputs from convert_aovs_to_exr_data
@@ -118,6 +126,7 @@ def save_all_aovs_exr_to_subdirs(
         "normal": "normal",
         "object_id": "object_id",
         "semantic": "semantic",
+        "shape_index": "shape_index",
     }
     
     for aov_name, subdir_name in aov_subdirs.items():
@@ -128,10 +137,13 @@ def save_all_aovs_exr_to_subdirs(
         output_path = subdir / filename
         
         if aov_name == "depth":
-            # Single-channel depth
+            # Single-channel depth (half-float)
             save_exr_depth(getattr(exr_outputs, aov_name), output_path)
+        elif aov_name == "shape_index":
+            # Single-channel shape index (full float32 for integer precision)
+            save_exr_shape_index(getattr(exr_outputs, aov_name), output_path)
         else:
-            # RGB channels
+            # RGB channels (half-float)
             save_exr_rgb(getattr(exr_outputs, aov_name), output_path)
 
 
@@ -146,9 +158,10 @@ def main():
     # Use first frame for geometry parsing (geometry is static, only camera moves)
     options = ParseOptions(
         time_code=Usd.TimeCode(FRAMES[0]),
-        path_filter=None,  # Load all visible meshes
-        skip_invisible=True,
-        skip_proxy=True,
+        path_filter=None,
+        skip_invisible=True,           # Filter out invisible prims
+        skip_proxy=True,               # Filter out /proxy/ paths
+        require_render_purpose=True,   # Only include purpose="render" prims
     )
     
     diegetics = parse_diegetics(
@@ -173,11 +186,19 @@ def main():
 
     # Phase 2: Setup render context (uses diffuse_albedo for lit pass) + ColorLUTs
     ctx, color_luts, _ = setup_render_context(diegetics, RENDER_CONFIG)
+    
+    # Save shape index mapping (once, since geometry is static)
+    RENDER_CONFIG.output_dir.mkdir(parents=True, exist_ok=True)
+    mapping_path = RENDER_CONFIG.output_dir / "shape_index_mapping.json"
+    save_shape_index_mapping(diegetics, mapping_path)
 
-    # Phase 3: Render all AOVs for each frame
+    # Phase 3: Render all AOVs for each frame (with headlight, no shadows)
     for i, frame in enumerate(FRAMES):
         time_code = Usd.TimeCode(frame)
         camera = get_camera_from_stage(stage, CAMERA_PATH, time_code, verbose=False)
+        
+        # Update lighting to headlight (follows camera, no shadows)
+        update_lights_for_headlight(ctx, camera.forward)
         
         # Single render pass
         outputs = render_all_aovs(ctx, camera, RENDER_CONFIG)
@@ -205,6 +226,8 @@ def main():
     print("  - normal/")
     print("  - object_id/")
     print("  - semantic/")
+    print("  - shape_index/")
+    print("  - shape_index_mapping.json")
     print("=" * 70)
 
 
